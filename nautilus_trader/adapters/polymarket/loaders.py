@@ -33,6 +33,7 @@ from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AggressorSide
 from nautilus_trader.model.enums import BookAction
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import RecordFlag
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.instruments import BinaryOption
 
@@ -630,6 +631,17 @@ class PolymarketDataLoader:
                 )
 
             if deltas:
+                # Set F_LAST flag on final delta to signal end of batch
+                last = deltas[-1]
+                deltas[-1] = OrderBookDelta(
+                    instrument_id=last.instrument_id,
+                    action=last.action,
+                    order=last.order,
+                    flags=RecordFlag.F_LAST,
+                    sequence=last.sequence,
+                    ts_event=last.ts_event,
+                    ts_init=last.ts_init,
+                )
                 all_deltas.append(OrderBookDeltas(instrument_id=instrument_id, deltas=deltas))
 
         return all_deltas
