@@ -641,8 +641,10 @@ class PolymarketExecutionClient(LiveExecutionClient):
         else:
             instrument_ids = [inst.id for inst in self._cache.instruments(venue=POLYMARKET_VENUE)]
 
-        if self._config.use_data_api:
-            # Fetch all positions once (bulk operation)
+        if not instrument_ids or self._config.use_data_api:
+            # Use Data API for bulk fetch. This is also required when the cache
+            # is empty (e.g., startup reconciliation) since the CLOB API path
+            # needs pre-known instrument IDs to query.
             quantities_by_instrument = await self._fetch_quantities_from_gamma_api(instrument_ids)
         else:
             # Fetch positions individually (one API call per instrument)
@@ -763,10 +765,16 @@ class PolymarketExecutionClient(LiveExecutionClient):
         # Convert to quantities by instrument ID
         quantities: dict[InstrumentId, Quantity] = {}
 
-        for instrument_id in instrument_ids:
-            size = size_by_asset.get(instrument_id, 0.0)
-            # Gamma API returns size as decimal float (e.g., 1.5 shares)
-            quantities[instrument_id] = Quantity(float(size), precision=USDC_POS.precision)
+        if instrument_ids:
+            # Filter to requested instruments
+            for instrument_id in instrument_ids:
+                size = size_by_asset.get(instrument_id, 0.0)
+                quantities[instrument_id] = Quantity(float(size), precision=USDC_POS.precision)
+        else:
+            # No filter — return all positions from the venue (startup discovery)
+            for instrument_id, size in size_by_asset.items():
+                if size > 0:
+                    quantities[instrument_id] = Quantity(float(size), precision=USDC_POS.precision)
 
         return quantities
 
