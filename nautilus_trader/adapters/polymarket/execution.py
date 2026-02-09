@@ -237,6 +237,13 @@ class PolymarketExecutionClient(LiveExecutionClient):
     async def _connect(self) -> None:
         await self._instrument_provider.initialize()
 
+        # Ensure instruments are in the cache so that reconciliation
+        # (which runs before strategies start) can find them even if the
+        # data client hasn't finished populating the cache yet.
+        for instrument in self._instrument_provider.get_all().values():
+            if not self._cache.instrument(instrument.id):
+                self._cache.add_instrument(instrument)
+
         # Add initial market subscriptions
         instruments = self._cache.instruments(venue=POLYMARKET_VENUE)
         for instrument in instruments:
