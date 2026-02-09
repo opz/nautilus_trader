@@ -217,39 +217,38 @@ class PolymarketInstrumentProvider(InstrumentProvider):
         # Create a copy to avoid mutating the caller's filters
         filters = filters.copy() if filters is not None else {}
 
-        if (
-            len(condition_ids) <= 100
-        ):  # We can filter directly by condition_id, but there is an API limit of max 100 condition_ids in the query string
+        # Batch condition_ids into chunks of 100 (Gamma API query string limit)
+        batch_size = 100
+        batches = [condition_ids[i:i + batch_size] for i in range(0, len(condition_ids), batch_size)]
+        self._log.info(
+            f"Loading {len(instrument_ids)} instruments from {len(condition_ids)} markets "
+            f"in {len(batches)} batch(es) using Gamma API",
+        )
+
+        for batch_idx, batch in enumerate(batches):
+            batch_filters = dict(filters)
+            batch_filters["condition_ids"] = batch
+            batch_markets = await list_markets(http_client=self._http_client, filters=batch_filters)
             self._log.info(
-                f"Loading {len(instrument_ids)} instruments from {len(condition_ids)} markets, using direct condition_id filtering",
+                f"Batch {batch_idx + 1}/{len(batches)}: loaded {len(batch_markets)} markets",
             )
-            filters["condition_ids"] = condition_ids
-        else:
-            self._log.info(
-                f"Loading {len(instrument_ids)} instruments from {len(condition_ids)} markets, using bulk load of all markets",
-            )
-
-        markets = await list_markets(http_client=self._http_client, filters=filters)
-        self._log.info(f"Loaded {len(markets)} markets using Gamma API")
-        for market in markets:
-            condition_id = market.get("conditionId")
-            if not condition_id:
-                continue
-
-            if condition_ids and condition_id not in condition_ids:
-                continue
-
-            normalized_market = normalize_gamma_market_to_clob_format(market)
-
-            for token_info in normalized_market.get("tokens", []):
-                token_id = token_info["token_id"]
-
-                # Only load if this specific token was requested
-                if requested_token_ids and token_id not in requested_token_ids:
+            batch_condition_ids = set(batch)
+            for market in batch_markets:
+                condition_id = market.get("conditionId")
+                if not condition_id or condition_id not in batch_condition_ids:
                     continue
 
-                outcome = token_info["outcome"]
-                self._load_instrument(normalized_market, token_id, outcome)
+                normalized_market = normalize_gamma_market_to_clob_format(market)
+
+                for token_info in normalized_market.get("tokens", []):
+                    token_id = token_info["token_id"]
+
+                    # Only load if this specific token was requested
+                    if requested_token_ids and token_id not in requested_token_ids:
+                        continue
+
+                    outcome = token_info["outcome"]
+                    self._load_instrument(normalized_market, token_id, outcome)
 
     async def _load_ids_using_clob_api(
         self,
