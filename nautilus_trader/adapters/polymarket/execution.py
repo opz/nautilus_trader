@@ -17,6 +17,7 @@ import asyncio
 import json
 from collections import OrderedDict
 from collections import defaultdict
+from decimal import Decimal
 from typing import Any
 
 import msgspec
@@ -651,10 +652,13 @@ class PolymarketExecutionClient(LiveExecutionClient):
             quantities_by_instrument = await self._fetch_quantities_from_clob_api(instrument_ids)
 
         # Generate reports from quantities
-        for instrument_id, quantity in quantities_by_instrument.items():
+        for instrument_id, (quantity, avg_px_open) in quantities_by_instrument.items():
             position_side = PositionSide.LONG if quantity.raw > 0 else PositionSide.FLAT
             if position_side == PositionSide.LONG:
-                self._log.info(f"Long position for {instrument_id} of {quantity} shares")
+                self._log.info(
+                    f"Long position for {instrument_id} of {quantity} shares"
+                    + (f" @ avg_px {avg_px_open}" if avg_px_open else ""),
+                )
 
             now = self._clock.timestamp_ns()
             report = PositionStatusReport(
@@ -662,6 +666,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 instrument_id=instrument_id,
                 position_side=position_side,
                 quantity=quantity,
+                avg_px_open=avg_px_open,
                 report_id=UUID4(),
                 ts_last=now,
                 ts_init=now,
@@ -735,9 +740,12 @@ class PolymarketExecutionClient(LiveExecutionClient):
     async def _fetch_quantities_from_gamma_api(
         self,
         instrument_ids: list[InstrumentId],
-    ) -> dict[InstrumentId, Quantity]:
+    ) -> dict[InstrumentId, tuple[Quantity, Decimal | None]]:
         """
-        Fetch position quantities using Gamma API (bulk fetch).
+        Fetch position quantities and average prices using Gamma API (bulk fetch).
+
+        Returns a dict mapping instrument_id to (quantity, avg_px_open) tuples.
+        avg_px_open is extracted from the Data API ``avgPrice`` field.
         """
         self._log.debug("Fetching positions from Gamma API")
 
@@ -747,45 +755,53 @@ class PolymarketExecutionClient(LiveExecutionClient):
             size_threshold=0,
         )
 
-        # Map asset (token id) -> size (shares)
-        size_by_asset: dict[str, float] = {}
+        # Map instrument_id -> (size, avg_price)
+        position_data: dict[InstrumentId, tuple[float, Decimal | None]] = {}
         for p in positions:
             instrument_id = InstrumentId.from_str(
                 p.get("conditionId", "") + "-" + str(p.get("asset", "")) + ".POLYMARKET",
             )
             size_val = p.get("size", 0) or 0
+            avg_price_val = p.get("avgPrice")
             try:
-                size_by_asset[instrument_id] = float(size_val)
+                size = float(size_val)
+                avg_price = Decimal(str(avg_price_val)) if avg_price_val else None
+                position_data[instrument_id] = (size, avg_price)
             except Exception as e:
                 self._log.warning(
-                    f"Failed to parse position size for instrument {instrument_id}: {e}",
+                    f"Failed to parse position data for instrument {instrument_id}: {e}",
                 )
                 continue
 
         # Convert to quantities by instrument ID
-        quantities: dict[InstrumentId, Quantity] = {}
+        results: dict[InstrumentId, tuple[Quantity, Decimal | None]] = {}
 
         if instrument_ids:
             # Filter to requested instruments
             for instrument_id in instrument_ids:
-                size = size_by_asset.get(instrument_id, 0.0)
-                quantities[instrument_id] = Quantity(float(size), precision=USDC_POS.precision)
+                size, avg_price = position_data.get(instrument_id, (0.0, None))
+                qty = Quantity(float(size), precision=USDC_POS.precision)
+                results[instrument_id] = (qty, avg_price)
         else:
             # No filter — return all positions from the venue (startup discovery)
-            for instrument_id, size in size_by_asset.items():
+            for instrument_id, (size, avg_price) in position_data.items():
                 if size > 0:
-                    quantities[instrument_id] = Quantity(float(size), precision=USDC_POS.precision)
+                    qty = Quantity(float(size), precision=USDC_POS.precision)
+                    results[instrument_id] = (qty, avg_price)
 
-        return quantities
+        return results
 
     async def _fetch_quantities_from_clob_api(
         self,
         instrument_ids: list[InstrumentId],
-    ) -> dict[InstrumentId, Quantity]:
+    ) -> dict[InstrumentId, tuple[Quantity, Decimal | None]]:
         """
         Fetch position quantities using CLOB API (individual queries).
+
+        Returns a dict mapping instrument_id to (quantity, avg_px_open) tuples.
+        The CLOB API does not provide average price, so avg_px_open is always None.
         """
-        quantities: dict[InstrumentId, Quantity] = {}
+        quantities: dict[InstrumentId, tuple[Quantity, Decimal | None]] = {}
 
         for instrument_id in instrument_ids:
             self._log.debug(f"Requesting position for {instrument_id} from CLOB API")
@@ -800,10 +816,11 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 self._http_client.get_balance_allowance,
                 params,
             )
-            quantities[instrument_id] = Quantity.from_raw(
+            qty = Quantity.from_raw(
                 usdce_from_units(int(response["balance"])).raw,
                 precision=USDC_POS.precision,
             )
+            quantities[instrument_id] = (qty, None)
 
         return quantities
 
