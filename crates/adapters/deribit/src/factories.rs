@@ -92,8 +92,6 @@ impl DataClientFactory for DeribitDataClientFactory {
     }
 }
 
-// ------------------------------------------------------------------------------------------------
-
 impl ClientConfig for DeribitExecClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
@@ -124,7 +122,6 @@ impl ExecutionClientFactory for DeribitExecutionClientFactory {
         name: &str,
         config: &dyn ClientConfig,
         cache: Rc<RefCell<Cache>>,
-        clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let deribit_config = config
             .as_any()
@@ -149,7 +146,6 @@ impl ExecutionClientFactory for DeribitExecutionClientFactory {
             deribit_config.account_id,
             account_type,
             None, // base_currency
-            clock,
             cache,
         );
 
@@ -177,7 +173,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::http::models::DeribitInstrumentKind;
+    use crate::http::models::DeribitProductType;
 
     fn setup_test_env() {
         // Initialize data event sender for tests
@@ -201,7 +197,7 @@ mod tests {
     #[rstest]
     fn test_deribit_data_client_config_implements_client_config() {
         let config = DeribitDataClientConfig {
-            instrument_kinds: vec![DeribitInstrumentKind::Future],
+            product_types: vec![DeribitProductType::Future],
             ..Default::default()
         };
 
@@ -219,7 +215,7 @@ mod tests {
 
         let factory = DeribitDataClientFactory::new();
         let config = DeribitDataClientConfig {
-            instrument_kinds: vec![DeribitInstrumentKind::Future],
+            product_types: vec![DeribitProductType::Future],
             use_testnet: true,
             ..Default::default()
         };

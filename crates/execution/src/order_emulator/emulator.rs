@@ -30,8 +30,7 @@ use nautilus_common::{
         CancelAllOrders, CancelOrder, ModifyOrder, SubmitOrder, SubmitOrderList, TradingCommand,
     },
     msgbus::{
-        self,
-        handler::{ShareableMessageHandler, TypedMessageHandler},
+        self, TypedHandler,
         switchboard::{get_quotes_topic, get_trades_topic},
     },
 };
@@ -65,7 +64,7 @@ pub struct OrderEmulator {
     subscribed_trades: AHashSet<InstrumentId>,
     subscribed_strategies: AHashSet<StrategyId>,
     monitored_positions: AHashSet<PositionId>,
-    on_event_handler: Option<ShareableMessageHandler>,
+    on_event_handler: Option<TypedHandler<OrderEventAny>>,
     self_ref: Option<WeakCell<Self>>,
 }
 
@@ -138,7 +137,7 @@ impl OrderEmulator {
         self.actor.register(trader_id, clock, cache)
     }
 
-    pub fn set_on_event_handler(&mut self, handler: ShareableMessageHandler) {
+    pub fn set_on_event_handler(&mut self, handler: TypedHandler<OrderEventAny>) {
         self.on_event_handler = Some(handler);
     }
 
@@ -170,13 +169,11 @@ impl OrderEmulator {
         };
 
         let topic = get_quotes_topic(instrument_id);
-        let handler = ShareableMessageHandler(Rc::new(TypedMessageHandler::from(
-            move |quote: &QuoteTick| {
-                if let Some(emulator) = self_ref.upgrade() {
-                    emulator.borrow_mut().on_quote_tick(*quote);
-                }
-            },
-        )));
+        let handler = TypedHandler::from(move |quote: &QuoteTick| {
+            if let Some(emulator) = self_ref.upgrade() {
+                emulator.borrow_mut().on_quote_tick(*quote);
+            }
+        });
 
         self.actor
             .subscribe_quotes(topic, handler, instrument_id, None, None);
@@ -190,13 +187,11 @@ impl OrderEmulator {
         };
 
         let topic = get_trades_topic(instrument_id);
-        let handler = ShareableMessageHandler(Rc::new(TypedMessageHandler::from(
-            move |trade: &TradeTick| {
-                if let Some(emulator) = self_ref.upgrade() {
-                    emulator.borrow_mut().on_trade_tick(*trade);
-                }
-            },
-        )));
+        let handler = TypedHandler::from(move |trade: &TradeTick| {
+            if let Some(emulator) = self_ref.upgrade() {
+                emulator.borrow_mut().on_trade_tick(*trade);
+            }
+        });
 
         self.actor
             .subscribe_trades(topic, handler, instrument_id, None, None);
@@ -239,7 +234,7 @@ impl OrderEmulator {
         let emulated_orders: Vec<OrderAny> = self
             .cache
             .borrow()
-            .orders_emulated(None, None, None, None)
+            .orders_emulated(None, None, None, None, None)
             .into_iter()
             .cloned()
             .collect();
@@ -535,7 +530,7 @@ impl OrderEmulator {
 
             self.manager.send_risk_event(OrderEventAny::Emulated(event));
 
-            msgbus::publish(
+            msgbus::publish_order_event(
                 format!("events.order.{}", order.strategy_id()).into(),
                 &OrderEventAny::Emulated(event),
             );
@@ -551,7 +546,12 @@ impl OrderEmulator {
     fn handle_submit_order_list(&mut self, command: SubmitOrderList) {
         self.check_monitoring(command.strategy_id, command.position_id);
 
-        for order in &command.order_list.orders {
+        let orders: Vec<OrderAny> = self
+            .cache
+            .borrow()
+            .orders_for_ids(&command.order_list.client_order_ids, &command);
+
+        for order in &orders {
             if let Some(parent_order_id) = order.parent_order_id() {
                 let cache = self.cache.borrow();
                 let parent_order = if let Some(parent_order) = cache.order(&parent_order_id) {
@@ -880,16 +880,15 @@ impl OrderEmulator {
 
     fn check_monitoring(&mut self, strategy_id: StrategyId, position_id: Option<PositionId>) {
         if !self.subscribed_strategies.contains(&strategy_id) {
-            // Subscribe to all strategy events
+            // Subscribe to strategy order events
             if let Some(handler) = &self.on_event_handler {
-                msgbus::subscribe_str(format!("events.order.{strategy_id}"), handler.clone(), None);
-                msgbus::subscribe_str(
-                    format!("events.position.{strategy_id}"),
+                msgbus::subscribe_order_events(
+                    format!("events.order.{strategy_id}").into(),
                     handler.clone(),
                     None,
                 );
                 self.subscribed_strategies.insert(strategy_id);
-                log::info!("Subscribed to strategy {strategy_id} order and position events");
+                log::info!("Subscribed to strategy {strategy_id} order events");
             }
         }
 
@@ -1062,7 +1061,7 @@ impl OrderEmulator {
                 log::error!("Failed to add order: {e}");
             }
 
-            msgbus::publish(
+            msgbus::publish_order_event(
                 format!("events.order.{}", order.strategy_id()).into(),
                 transformed.last_event(),
             );
@@ -1095,7 +1094,7 @@ impl OrderEmulator {
             log::info!("Releasing order {}", order.client_order_id());
 
             // Publish event
-            msgbus::publish(
+            msgbus::publish_order_event(
                 format!("events.order.{}", transformed.strategy_id()).into(),
                 &OrderEventAny::Released(event),
             );
@@ -1191,7 +1190,7 @@ impl OrderEmulator {
                 log::error!("Failed to add order: {e}");
             }
 
-            msgbus::publish(
+            msgbus::publish_order_event(
                 format!("events.order.{}", order.strategy_id()).into(),
                 transformed.last_event(),
             );
@@ -1224,7 +1223,7 @@ impl OrderEmulator {
             log::info!("Releasing order {}", order.client_order_id());
 
             // Publish event
-            msgbus::publish(
+            msgbus::publish_order_event(
                 format!("events.order.{}", order.strategy_id()).into(),
                 &OrderEventAny::Released(event),
             );

@@ -129,7 +129,7 @@ cdef class Cache(CacheFacade):
         self._mark_xrates: dict[tuple[Currency, Currency], double] = {}
         self._mark_prices: dict[InstrumentId, deque[MarkPriceUpdate]] = {}
         self._index_prices: dict[InstrumentId, deque[IndexPriceUpdate]] = {}
-        self._funding_rates: dict[InstrumentId, FundingRateUpdate] = {}
+        self._funding_rates: dict[InstrumentId, deque[FundingRateUpdate]] = {}
         self._bars: dict[BarType, deque[Bar]] = {}
         self._bars_bid: dict[InstrumentId, Bar] = {}
         self._bars_ask: dict[InstrumentId, Bar] = {}
@@ -852,6 +852,8 @@ cdef class Cache(CacheFacade):
             ClientOrderId linked_order_id
             Order order
             Order linked_order
+            set[OrderListId] affected_order_list_ids = set()
+
         for client_order_id in self._index_orders_closed.copy():
             order = self._orders.get(client_order_id)
             if order is not None and order.is_closed_c() and order.ts_closed + buffer_ns <= ts_now:
@@ -862,9 +864,31 @@ cdef class Cache(CacheFacade):
                         if linked_order is not None and linked_order.is_open_c():
                             break  # Do not purge if linked order still open
                     else:
+                        if order.order_list_id is not None:
+                            affected_order_list_ids.add(order.order_list_id)
                         self.purge_order(client_order_id, purge_from_database)
                 else:
+                    if order.order_list_id is not None:
+                        affected_order_list_ids.add(order.order_list_id)
                     self.purge_order(client_order_id, purge_from_database)
+
+        cdef:
+            OrderListId order_list_id
+            OrderList order_list
+            bint all_purged
+        for order_list_id in affected_order_list_ids:
+            order_list = self._order_lists.get(order_list_id)
+            if order_list is not None:
+                all_purged = True
+
+                for o in order_list.orders:
+                    if o.client_order_id in self._orders:
+                        all_purged = False
+                        break
+
+                if all_purged:
+                    self._order_lists.pop(order_list_id, None)
+                    self._log.info(f"Purged {order_list_id}", LogColor.BLUE)
 
     cpdef void purge_closed_positions(
         self,
@@ -1677,7 +1701,14 @@ cdef class Cache(CacheFacade):
         """
         Condition.not_none(funding_rate, "funding_rate")
 
-        self._funding_rates[funding_rate.instrument_id] = funding_rate
+        funding_rates = self._funding_rates.get(funding_rate.instrument_id)
+
+        if not funding_rates:
+            # The instrument_id was not registered
+            funding_rates = deque(maxlen=self.tick_capacity)
+            self._funding_rates[funding_rate.instrument_id] = funding_rates
+
+        funding_rates.appendleft(funding_rate)
 
     cpdef void add_bar(self, Bar bar):
         """
@@ -2743,6 +2774,24 @@ cdef class Cache(CacheFacade):
 
         return list(self._index_prices.get(instrument_id, []))
 
+    cpdef list funding_rates(self, InstrumentId instrument_id):
+        """
+        Return funding rates for the given instrument ID.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the mark prices to get.
+
+        Returns
+        -------
+        list[FundingRateUpdate]
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        return list(self._funding_rates.get(instrument_id, []))
+
     cpdef list bars(self, BarType bar_type):
         """
         Return bars for the given bar type.
@@ -3120,9 +3169,11 @@ cdef class Cache(CacheFacade):
         except IndexError:
             return None
 
-    cpdef FundingRateUpdate funding_rate(self, InstrumentId instrument_id):
+    cpdef FundingRateUpdate funding_rate(self, InstrumentId instrument_id, int index = 0):
         """
-        Return the funding rate for the given instrument ID (if found).
+        Return the funding rate for the given instrument ID at the given index (if found).
+
+        Last funding rate if no index specified.
 
         Parameters
         ----------
@@ -3132,12 +3183,24 @@ cdef class Cache(CacheFacade):
         Returns
         -------
         FundingRateUpdate or ``None``
-            If no funding rate then returns ``None``.
+            If no funding rates or no funding rate at the index then returns ``None``.
+
+        Notes
+        -----
+        Reverse indexed (most recent index price at index 0).
 
         """
         Condition.not_none(instrument_id, "instrument_id")
 
-        return self._funding_rates.get(instrument_id)
+        funding_rates = self._funding_rates.get(instrument_id)
+
+        if not funding_rates:
+            return None
+
+        try:
+            return funding_rates[index]
+        except IndexError:
+            return None
 
     cpdef Bar bar(self, BarType bar_type, int index = 0):
         """
@@ -3269,6 +3332,24 @@ cdef class Cache(CacheFacade):
 
         return len(self._index_prices.get(instrument_id, []))
 
+    cpdef int funding_rate_count(self, InstrumentId instrument_id):
+        """
+        The count of funding rates for the given instrument ID.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the index prices.
+
+        Returns
+        -------
+        int
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        return len(self._funding_rates.get(instrument_id, []))
+
     cpdef int bar_count(self, BarType bar_type):
         """
         The count of bars for the given bar type.
@@ -3380,6 +3461,25 @@ cdef class Cache(CacheFacade):
 
         return self.index_price_count(instrument_id) > 0
 
+    cpdef bint has_funding_rates(self, InstrumentId instrument_id):
+        """
+        Return a value indicating whether the cache has funding rates for the
+        given instrument ID.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument ID for the funding rates.
+
+        Returns
+        -------
+        bool
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        return self.funding_rate_count(instrument_id) > 0
+
     cpdef bint has_bars(self, BarType bar_type):
         """
         Return a value indicating whether the cache has bars for the given bar
@@ -3429,7 +3529,7 @@ cdef class Cache(CacheFacade):
         Raises
         ------
         ValueError
-            If `price_type` is ``LAST`` or ``MARK``.
+            If `price_type` is ``LAST``.
 
         """
         Condition.not_none(from_currency, "from_currency")
@@ -3439,6 +3539,9 @@ cdef class Cache(CacheFacade):
             # When the source and target currencies are identical,
             # no conversion is needed; return an exchange rate of 1.0.
             return 1.0
+
+        if price_type == PriceType.MARK:
+            return self.get_mark_xrate(from_currency, to_currency)
 
         cdef tuple quotes = self._build_quote_table(venue)
         try:
@@ -3486,7 +3589,7 @@ cdef class Cache(CacheFacade):
 
         return bid_quotes, ask_quotes
 
-    cpdef get_mark_xrate(
+    cpdef object get_mark_xrate(
         self,
         Currency from_currency,
         Currency to_currency,

@@ -52,17 +52,24 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::{consts::BINANCE_VENUE, parse::bar_spec_to_binance_interval},
+    common::{
+        consts::BINANCE_VENUE, credential::resolve_ed25519_credentials, enums::BinanceProductType,
+        parse::bar_spec_to_binance_interval,
+    },
     config::BinanceDataClientConfig,
     spot::{
         http::client::BinanceSpotHttpClient,
-        websocket::streams::{client::BinanceSpotWebSocketClient, messages::NautilusWsMessage},
+        websocket::streams::{
+            client::BinanceSpotWebSocketClient,
+            messages::{BinanceSpotWsMessage, NautilusSpotDataWsMessage},
+        },
     },
 };
 
 /// Binance Spot data client for SBE market data.
 #[derive(Debug)]
 pub struct BinanceSpotDataClient {
+    clock: &'static AtomicTime,
     client_id: ClientId,
     config: BinanceDataClientConfig,
     http_client: BinanceSpotHttpClient,
@@ -72,7 +79,6 @@ pub struct BinanceSpotDataClient {
     tasks: Vec<JoinHandle<()>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instruments: Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
-    clock: &'static AtomicTime,
 }
 
 impl BinanceSpotDataClient {
@@ -82,9 +88,6 @@ impl BinanceSpotDataClient {
     ///
     /// Returns an error if the client fails to initialize.
     pub fn new(client_id: ClientId, config: BinanceDataClientConfig) -> anyhow::Result<Self> {
-        let clock = get_atomic_clock_realtime();
-        let data_sender = get_data_event_sender();
-
         let http_client = BinanceSpotHttpClient::new(
             config.environment,
             config.api_key.clone(),
@@ -95,15 +98,32 @@ impl BinanceSpotDataClient {
             None, // proxy_url
         )?;
 
+        let product_type = config
+            .product_types
+            .first()
+            .copied()
+            .unwrap_or(BinanceProductType::Spot);
+
+        let ed25519_creds = resolve_ed25519_credentials(
+            config.ed25519_api_key.clone(),
+            config.ed25519_api_secret.clone(),
+            config.environment,
+            product_type,
+        );
+
         // SBE streams require Ed25519 authentication
         let ws_client = BinanceSpotWebSocketClient::new(
             config.base_url_ws.clone(),
-            config.ed25519_api_key.clone(),
-            config.ed25519_api_secret.clone(),
+            ed25519_creds.as_ref().map(|(k, _)| k.clone()),
+            ed25519_creds.as_ref().map(|(_, s)| s.clone()),
             Some(20), // Heartbeat interval
         )?;
 
+        let clock = get_atomic_clock_realtime();
+        let data_sender = get_data_event_sender();
+
         Ok(Self {
+            clock,
             client_id,
             config,
             http_client,
@@ -113,7 +133,6 @@ impl BinanceSpotDataClient {
             tasks: Vec::new(),
             data_sender,
             instruments: Arc::new(RwLock::new(AHashMap::new())),
-            clock,
         })
     }
 
@@ -139,32 +158,34 @@ impl BinanceSpotDataClient {
     }
 
     fn handle_ws_message(
-        message: NautilusWsMessage,
+        msg: BinanceSpotWsMessage,
         data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
         instruments: &Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
     ) {
-        match message {
-            NautilusWsMessage::Data(payloads) => {
-                for data in payloads {
-                    Self::send_data(data_sender, data);
+        match msg {
+            BinanceSpotWsMessage::Data(data_msg) => match data_msg {
+                NautilusSpotDataWsMessage::Data(payloads) => {
+                    for data in payloads {
+                        Self::send_data(data_sender, data);
+                    }
                 }
-            }
-            NautilusWsMessage::Deltas(deltas) => {
-                Self::send_data(data_sender, Data::Deltas(OrderBookDeltas_API::new(deltas)));
-            }
-            NautilusWsMessage::Instrument(instrument) => {
-                upsert_instrument(instruments, *instrument);
-            }
-            NautilusWsMessage::Error(e) => {
+                NautilusSpotDataWsMessage::Deltas(deltas) => {
+                    Self::send_data(data_sender, Data::Deltas(OrderBookDeltas_API::new(deltas)));
+                }
+                NautilusSpotDataWsMessage::Instrument(instrument) => {
+                    upsert_instrument(instruments, *instrument);
+                }
+                NautilusSpotDataWsMessage::RawBinary(data) => {
+                    log::debug!("Unhandled binary message: {} bytes", data.len());
+                }
+                NautilusSpotDataWsMessage::RawJson(value) => {
+                    log::debug!("Unhandled JSON message: {value:?}");
+                }
+            },
+            BinanceSpotWsMessage::Error(e) => {
                 log::error!("Binance WebSocket error: code={}, msg={}", e.code, e.msg);
             }
-            NautilusWsMessage::RawBinary(data) => {
-                log::debug!("Unhandled binary message: {} bytes", data.len());
-            }
-            NautilusWsMessage::RawJson(value) => {
-                log::debug!("Unhandled JSON message: {value:?}");
-            }
-            NautilusWsMessage::Reconnected => {
+            BinanceSpotWsMessage::Reconnected => {
                 log::info!("WebSocket reconnected");
             }
         }
@@ -507,7 +528,7 @@ impl DataClient for BinanceSpotDataClient {
         Ok(())
     }
 
-    fn request_instruments(&self, request: &RequestInstruments) -> anyhow::Result<()> {
+    fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instruments_cache = self.instruments.clone();
@@ -516,7 +537,7 @@ impl DataClient for BinanceSpotDataClient {
         let venue = self.venue();
         let start = request.start;
         let end = request.end;
-        let params = request.params.clone();
+        let params = request.params;
         let clock = self.clock;
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
@@ -550,7 +571,7 @@ impl DataClient for BinanceSpotDataClient {
         Ok(())
     }
 
-    fn request_instrument(&self, request: &RequestInstrument) -> anyhow::Result<()> {
+    fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instruments = self.instruments.clone();
@@ -559,7 +580,7 @@ impl DataClient for BinanceSpotDataClient {
         let client_id = request.client_id.unwrap_or(self.client_id);
         let start = request.start;
         let end = request.end;
-        let params = request.params.clone();
+        let params = request.params;
         let clock = self.clock;
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
@@ -622,14 +643,14 @@ impl DataClient for BinanceSpotDataClient {
         Ok(())
     }
 
-    fn request_trades(&self, request: &RequestTrades) -> anyhow::Result<()> {
+    fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instrument_id = request.instrument_id;
         let limit = request.limit.map(|n| n.get() as u32);
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let params = request.params.clone();
+        let params = request.params;
         let clock = self.clock;
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
@@ -662,7 +683,7 @@ impl DataClient for BinanceSpotDataClient {
         Ok(())
     }
 
-    fn request_bars(&self, request: &RequestBars) -> anyhow::Result<()> {
+    fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let bar_type = request.bar_type;
@@ -671,7 +692,7 @@ impl DataClient for BinanceSpotDataClient {
         let limit = request.limit.map(|n| n.get() as u32);
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
-        let params = request.params.clone();
+        let params = request.params;
         let clock = self.clock;
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);

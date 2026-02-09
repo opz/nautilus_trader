@@ -33,6 +33,27 @@ A high-performance order book implemented in Rust is available to maintain order
 Top-of-book data, such as `QuoteTick`, `TradeTick` and `Bar`, can also be used for backtesting, with markets operating on `L1_MBP` book types.
 :::
 
+### Delta flags and event boundaries
+
+Each `OrderBookDelta` carries a `flags` field using `RecordFlag` bitmask values
+to signal event boundaries to the `DataEngine`:
+
+- `F_LAST`: Marks the final delta in a logical event group. When `buffer_deltas`
+  is enabled, the `DataEngine` accumulates deltas and only publishes to
+  subscribers when it encounters `F_LAST`. Every event group **must** end with
+  a delta that has `F_LAST` set.
+- `F_SNAPSHOT`: Marks deltas that belong to a snapshot (as opposed to an
+  incremental update). Snapshot sequences begin with a `Clear` action followed
+  by `Add` deltas reconstructing the full book state. The last delta in a
+  snapshot has both `F_SNAPSHOT | F_LAST` set.
+
+:::warning
+A missing `F_LAST` on the final delta in an event group causes buffered consumers
+to accumulate deltas indefinitely without publishing. This applies to incremental
+updates and snapshots alike, including empty book snapshots where only a `Clear`
+delta is emitted.
+:::
+
 ## Instruments
 
 NautilusTrader supports a variety of instrument types across spot, derivatives, and specialty markets:
@@ -441,7 +462,7 @@ The `ts_init` field indicates when the message was originally received.
 
 ## Data flow
 
-The platform ensures consistency by flowing data through the same pathways across all system [environment contexts](/concepts/architecture.md#environment-contexts)
+The platform ensures consistency by flowing data through the same pathways across all system [environment contexts](architecture.md#environment-contexts)
 (e.g., `backtest`, `sandbox`, `live`). Data is primarily transported via the `MessageBus` to the `DataEngine`
 and then distributed to subscribed or registered handlers.
 
@@ -1758,3 +1779,9 @@ class GreeksData(Data):
         delta: float = 0.0,
   ) -> GreeksData: ...
 ```
+
+## Related guides
+
+- [Instruments](instruments.md) - Financial instruments referenced by data.
+- [Cache](cache.md) - Data storage and retrieval.
+- [Adapters](adapters.md) - Data sources and connectivity.

@@ -40,21 +40,24 @@ use super::{
     error::{BinanceFuturesHttpError, BinanceFuturesHttpResult},
     models::{
         BatchOrderResult, BinanceBookTicker, BinanceCancelAllOrdersResponse, BinanceFundingRate,
-        BinanceFuturesAccountInfo, BinanceFuturesCoinExchangeInfo, BinanceFuturesCoinSymbol,
-        BinanceFuturesKline, BinanceFuturesMarkPrice, BinanceFuturesOrder,
-        BinanceFuturesTicker24hr, BinanceFuturesTrade, BinanceFuturesUsdExchangeInfo,
-        BinanceFuturesUsdSymbol, BinanceHedgeModeResponse, BinanceLeverageResponse,
-        BinanceOpenInterest, BinanceOrderBook, BinancePositionRisk, BinancePriceTicker,
-        BinanceServerTime, BinanceUserTrade, ListenKeyResponse,
+        BinanceFuturesAccountInfo, BinanceFuturesAlgoOrder, BinanceFuturesAlgoOrderCancelResponse,
+        BinanceFuturesCoinExchangeInfo, BinanceFuturesCoinSymbol, BinanceFuturesKline,
+        BinanceFuturesMarkPrice, BinanceFuturesOrder, BinanceFuturesTicker24hr,
+        BinanceFuturesTrade, BinanceFuturesUsdExchangeInfo, BinanceFuturesUsdSymbol,
+        BinanceHedgeModeResponse, BinanceLeverageResponse, BinanceOpenInterest, BinanceOrderBook,
+        BinancePositionRisk, BinancePriceTicker, BinanceServerTime, BinanceUserTrade,
+        ListenKeyResponse,
     },
     query::{
-        BatchCancelItem, BatchModifyItem, BatchOrderItem, BinanceAllOrdersParams,
-        BinanceBookTickerParams, BinanceCancelAllOrdersParams, BinanceCancelOrderParams,
+        BatchCancelItem, BatchModifyItem, BatchOrderItem, BinanceAlgoOrderQueryParams,
+        BinanceAllAlgoOrdersParams, BinanceAllOrdersParams, BinanceBookTickerParams,
+        BinanceCancelAllAlgoOrdersParams, BinanceCancelAllOrdersParams, BinanceCancelOrderParams,
         BinanceDepthParams, BinanceFundingRateParams, BinanceKlinesParams, BinanceMarkPriceParams,
-        BinanceModifyOrderParams, BinanceNewOrderParams, BinanceOpenInterestParams,
-        BinanceOpenOrdersParams, BinanceOrderQueryParams, BinancePositionRiskParams,
-        BinanceSetLeverageParams, BinanceSetMarginTypeParams, BinanceTicker24hrParams,
-        BinanceTradesParams, BinanceUserTradesParams, ListenKeyParams,
+        BinanceModifyOrderParams, BinanceNewAlgoOrderParams, BinanceNewOrderParams,
+        BinanceOpenAlgoOrdersParams, BinanceOpenInterestParams, BinanceOpenOrdersParams,
+        BinanceOrderQueryParams, BinancePositionRiskParams, BinanceSetLeverageParams,
+        BinanceSetMarginTypeParams, BinanceTicker24hrParams, BinanceTradesParams,
+        BinanceUserTradesParams, ListenKeyParams,
     },
 };
 use crate::common::{
@@ -64,12 +67,13 @@ use crate::common::{
     },
     credential::Credential,
     enums::{
-        BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide, BinanceProductType,
-        BinanceRateLimitInterval, BinanceRateLimitType, BinanceSide, BinanceTimeInForce,
+        BinanceAlgoType, BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide,
+        BinanceProductType, BinanceRateLimitInterval, BinanceRateLimitType, BinanceSide,
+        BinanceTimeInForce,
     },
     models::BinanceErrorResponse,
     parse::{parse_coinm_instrument, parse_usdm_instrument},
-    symbol::format_binance_symbol,
+    symbol::{format_binance_symbol, format_instrument_id},
     urls::get_http_base_url,
 };
 
@@ -411,12 +415,16 @@ impl BinanceRawFuturesHttpClient {
     }
 
     fn build_url(&self, path: &str, query: &str) -> String {
-        let normalized = if path.starts_with('/') {
+        // Full API paths (e.g., /fapi/v2/account) bypass the default api_path
+        let url_path = if path.starts_with("/fapi/") || path.starts_with("/dapi/") {
             path.to_string()
+        } else if path.starts_with('/') {
+            format!("{}{}", self.api_path, path)
         } else {
-            format!("/{path}")
+            format!("{}/{}", self.api_path, path)
         };
-        let mut url = format!("{}{}{}", self.base_url, self.api_path, normalized);
+
+        let mut url = format!("{}{}", self.base_url, url_path);
         if !query.is_empty() {
             url.push('?');
             url.push_str(query);
@@ -714,7 +722,13 @@ impl BinanceRawFuturesHttpClient {
     ///
     /// Returns an error if the request fails.
     pub async fn query_account(&self) -> BinanceFuturesHttpResult<BinanceFuturesAccountInfo> {
-        self.get::<(), _>("account", None, true, false).await
+        // USD-M uses /fapi/v2/account, COIN-M uses /dapi/v1/account
+        let path = if self.api_path.starts_with("/fapi") {
+            "/fapi/v2/account"
+        } else {
+            "/dapi/v1/account"
+        };
+        self.get::<(), _>(path, None, true, false).await
     }
 
     /// Fetches position risk information.
@@ -726,7 +740,13 @@ impl BinanceRawFuturesHttpClient {
         &self,
         params: &BinancePositionRiskParams,
     ) -> BinanceFuturesHttpResult<Vec<BinancePositionRisk>> {
-        self.get("positionRisk", Some(params), true, false).await
+        // USD-M uses /fapi/v2/positionRisk, COIN-M uses /dapi/v1/positionRisk
+        let path = if self.api_path.starts_with("/fapi") {
+            "/fapi/v2/positionRisk"
+        } else {
+            "/dapi/v1/positionRisk"
+        };
+        self.get(path, Some(params), true, false).await
     }
 
     /// Fetches user trades for a symbol.
@@ -892,6 +912,87 @@ impl BinanceRawFuturesHttpClient {
         self.batch_request_delete("batchOrders", cancels, true)
             .await
     }
+
+    /// Submits a new algo order (conditional order).
+    ///
+    /// Algo orders include STOP_MARKET, STOP (stop-limit), TAKE_PROFIT, TAKE_PROFIT_MARKET,
+    /// and TRAILING_STOP_MARKET order types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn submit_algo_order(
+        &self,
+        params: &BinanceNewAlgoOrderParams,
+    ) -> BinanceFuturesHttpResult<BinanceFuturesAlgoOrder> {
+        self.post("algoOrder", Some(params), None, true, true).await
+    }
+
+    /// Cancels an algo order.
+    ///
+    /// Must provide either `algo_id` or `client_algo_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn cancel_algo_order(
+        &self,
+        params: &BinanceAlgoOrderQueryParams,
+    ) -> BinanceFuturesHttpResult<BinanceFuturesAlgoOrderCancelResponse> {
+        self.request_delete("algoOrder", Some(params), true, true)
+            .await
+    }
+
+    /// Queries a single algo order.
+    ///
+    /// Must provide either `algo_id` or `client_algo_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn query_algo_order(
+        &self,
+        params: &BinanceAlgoOrderQueryParams,
+    ) -> BinanceFuturesHttpResult<BinanceFuturesAlgoOrder> {
+        self.get("algoOrder", Some(params), true, false).await
+    }
+
+    /// Queries all open algo orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn query_open_algo_orders(
+        &self,
+        params: &BinanceOpenAlgoOrdersParams,
+    ) -> BinanceFuturesHttpResult<Vec<BinanceFuturesAlgoOrder>> {
+        self.get("openAlgoOrders", Some(params), true, false).await
+    }
+
+    /// Queries all algo orders including historical (7-day limit).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn query_all_algo_orders(
+        &self,
+        params: &BinanceAllAlgoOrdersParams,
+    ) -> BinanceFuturesHttpResult<Vec<BinanceFuturesAlgoOrder>> {
+        self.get("allAlgoOrders", Some(params), true, false).await
+    }
+
+    /// Cancels all open algo orders for a symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn cancel_all_algo_orders(
+        &self,
+        params: &BinanceCancelAllAlgoOrdersParams,
+    ) -> BinanceFuturesHttpResult<BinanceCancelAllOrdersResponse> {
+        self.request_delete("algoOpenOrders", Some(params), true, true)
+            .await
+    }
 }
 
 /// Response wrapper for mark price endpoint.
@@ -924,6 +1025,44 @@ pub enum BinanceFuturesInstrument {
     UsdM(BinanceFuturesUsdSymbol),
     /// COIN-M futures symbol.
     CoinM(BinanceFuturesCoinSymbol),
+}
+
+impl BinanceFuturesInstrument {
+    /// Returns the symbol name for the instrument.
+    #[must_use]
+    pub const fn symbol(&self) -> Ustr {
+        match self {
+            Self::UsdM(s) => s.symbol,
+            Self::CoinM(s) => s.symbol,
+        }
+    }
+
+    /// Returns the price precision for the instrument.
+    #[must_use]
+    pub const fn price_precision(&self) -> i32 {
+        match self {
+            Self::UsdM(s) => s.price_precision,
+            Self::CoinM(s) => s.price_precision,
+        }
+    }
+
+    /// Returns the quantity precision for the instrument.
+    #[must_use]
+    pub const fn quantity_precision(&self) -> i32 {
+        match self {
+            Self::UsdM(s) => s.quantity_precision,
+            Self::CoinM(s) => s.quantity_precision,
+        }
+    }
+
+    /// Returns the Nautilus-formatted instrument ID.
+    #[must_use]
+    pub fn id(&self) -> InstrumentId {
+        match self {
+            Self::UsdM(s) => format_instrument_id(&s.symbol, BinanceProductType::UsdM),
+            Self::CoinM(s) => format_instrument_id(&s.symbol, BinanceProductType::CoinM),
+        }
+    }
 }
 
 /// Binance Futures HTTP client for USD-M and COIN-M perpetuals.
@@ -959,7 +1098,7 @@ impl BinanceFuturesHttpClient {
             BinanceProductType::UsdM | BinanceProductType::CoinM => {}
             _ => {
                 return Err(BinanceFuturesHttpError::ValidationError(format!(
-                    "BinanceFuturesHttpClient requires UsdM or CoinM product type, got {product_type:?}"
+                    "BinanceFuturesHttpClient requires UsdM or CoinM product type, was {product_type:?}"
                 )));
             }
         }
@@ -994,10 +1133,10 @@ impl BinanceFuturesHttpClient {
         &self.raw
     }
 
-    /// Returns a reference to the instruments cache.
+    /// Returns a clone of the instruments cache Arc.
     #[must_use]
-    pub fn instruments_cache(&self) -> &DashMap<Ustr, BinanceFuturesInstrument> {
-        &self.instruments
+    pub fn instruments_cache(&self) -> Arc<DashMap<Ustr, BinanceFuturesInstrument>> {
+        Arc::clone(&self.instruments)
     }
 
     /// Returns server time.
@@ -1125,8 +1264,14 @@ impl BinanceFuturesHttpClient {
 
                 let mut instruments = Vec::with_capacity(info.symbols.len());
 
-                for symbol in &info.symbols {
-                    match parse_usdm_instrument(symbol, ts_init, ts_init) {
+                for symbol in info.symbols {
+                    // Cache symbol for precision lookups
+                    self.instruments.insert(
+                        symbol.symbol,
+                        BinanceFuturesInstrument::UsdM(symbol.clone()),
+                    );
+
+                    match parse_usdm_instrument(&symbol, ts_init, ts_init) {
                         Ok(instrument) => instruments.push(instrument),
                         Err(e) => {
                             log::debug!(
@@ -1150,8 +1295,14 @@ impl BinanceFuturesHttpClient {
                     .await?;
 
                 let mut instruments = Vec::with_capacity(info.symbols.len());
-                for symbol in &info.symbols {
-                    match parse_coinm_instrument(symbol, ts_init, ts_init) {
+                for symbol in info.symbols {
+                    // Cache symbol for precision lookups
+                    self.instruments.insert(
+                        symbol.symbol,
+                        BinanceFuturesInstrument::CoinM(symbol.clone()),
+                    );
+
+                    match parse_coinm_instrument(&symbol, ts_init, ts_init) {
                         Ok(instrument) => instruments.push(instrument),
                         Err(e) => {
                             log::debug!(
@@ -1374,6 +1525,12 @@ impl BinanceFuturesHttpClient {
             anyhow::bail!("Order type {order_type:?} requires a trigger price");
         }
 
+        // MARKET and STOP_MARKET orders don't accept timeInForce
+        let requires_time_in_force = matches!(
+            order_type,
+            OrderType::Limit | OrderType::StopLimit | OrderType::LimitIfTouched
+        );
+
         let qty_str = quantity.to_string();
         let price_str = price.map(|p| p.to_string());
         let stop_price_str = trigger_price.map(|p| p.to_string());
@@ -1383,7 +1540,11 @@ impl BinanceFuturesHttpClient {
             symbol,
             side: binance_side,
             order_type: binance_order_type,
-            time_in_force: Some(binance_tif),
+            time_in_force: if requires_time_in_force {
+                Some(binance_tif)
+            } else {
+                None
+            },
             quantity: Some(qty_str),
             price: price_str,
             new_client_order_id: Some(client_id_str),
@@ -1398,9 +1559,88 @@ impl BinanceFuturesHttpClient {
             new_order_resp_type: None,
             good_till_date: None,
             recv_window: None,
+            price_match: None,
+            self_trade_prevention_mode: None,
         };
 
         let order = self.raw.submit_order(&params).await?;
+        order.to_order_status_report(account_id, instrument_id, size_precision)
+    }
+
+    /// Submits an algo order (conditional order) to the Binance Algo Service.
+    ///
+    /// As of 2025-12-09, Binance migrated conditional order types to the Algo Service API.
+    /// This method handles StopMarket, StopLimit, MarketIfTouched, LimitIfTouched,
+    /// and TrailingStopMarket orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The order type requires a trigger price but none is provided.
+    /// - The instrument is not cached.
+    /// - The request fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_algo_order(
+        &self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        reduce_only: bool,
+        position_side: Option<BinancePositionSide>,
+    ) -> anyhow::Result<OrderStatusReport> {
+        let symbol = format_binance_symbol(&instrument_id);
+        let size_precision = self.get_size_precision(&symbol)?;
+
+        let binance_side = BinanceSide::try_from(order_side)?;
+        let binance_order_type = order_type_to_binance_futures(order_type)?;
+        let binance_tif = BinanceTimeInForce::try_from(time_in_force)?;
+
+        anyhow::ensure!(
+            trigger_price.is_some(),
+            "Algo order type {order_type:?} requires a trigger price"
+        );
+
+        // Limit orders require time in force
+        let requires_time_in_force =
+            matches!(order_type, OrderType::StopLimit | OrderType::LimitIfTouched);
+
+        let qty_str = quantity.to_string();
+        let price_str = price.map(|p| p.to_string());
+        let trigger_price_str = trigger_price.map(|p| p.to_string());
+        let client_id_str = client_order_id.to_string();
+
+        let params = BinanceNewAlgoOrderParams {
+            symbol,
+            side: binance_side,
+            order_type: binance_order_type,
+            algo_type: BinanceAlgoType::Conditional,
+            position_side,
+            quantity: Some(qty_str),
+            price: price_str,
+            trigger_price: trigger_price_str,
+            time_in_force: if requires_time_in_force {
+                Some(binance_tif)
+            } else {
+                None
+            },
+            working_type: None,
+            close_position: None,
+            price_protect: None,
+            reduce_only: if reduce_only { Some(true) } else { None },
+            activation_price: None,
+            callback_rate: None,
+            client_algo_id: Some(client_id_str),
+            good_till_date: None,
+            recv_window: None,
+        };
+
+        let order = self.raw.submit_algo_order(&params).await?;
         order.to_order_status_report(account_id, instrument_id, size_precision)
     }
 
@@ -1522,6 +1762,33 @@ impl BinanceFuturesHttpClient {
         Ok(VenueOrderId::new(order.order_id.to_string()))
     }
 
+    /// Cancels an algo order (conditional order) via the Binance Algo Service.
+    ///
+    /// Use the `client_algo_id` which corresponds to the `client_order_id` used
+    /// when submitting the algo order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn cancel_algo_order(&self, client_order_id: ClientOrderId) -> anyhow::Result<()> {
+        let params = BinanceAlgoOrderQueryParams {
+            algo_id: None,
+            client_algo_id: Some(client_order_id.to_string()),
+            recv_window: None,
+        };
+
+        let response = self.raw.cancel_algo_order(&params).await?;
+        if response.code == 200 {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Cancel algo order failed: code={}, msg={}",
+                response.code,
+                response.msg
+            )
+        }
+    }
+
     /// Cancels all open orders for a symbol.
     ///
     /// # Errors
@@ -1546,6 +1813,27 @@ impl BinanceFuturesHttpClient {
         }
     }
 
+    /// Cancels all open algo orders for a symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn cancel_all_algo_orders(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let symbol = format_binance_symbol(&instrument_id);
+
+        let params = BinanceCancelAllAlgoOrdersParams {
+            symbol,
+            recv_window: None,
+        };
+
+        let response = self.raw.cancel_all_algo_orders(&params).await?;
+        if response.code == 200 {
+            Ok(())
+        } else {
+            anyhow::bail!("Cancel all algo orders failed: {}", response.msg);
+        }
+    }
+
     /// Cancels multiple orders in a single request (up to 5 orders).
     ///
     /// Each cancel in the batch is processed independently. The response contains
@@ -1559,6 +1847,45 @@ impl BinanceFuturesHttpClient {
         cancels: &[BatchCancelItem],
     ) -> BinanceFuturesHttpResult<Vec<BatchOrderResult>> {
         self.raw.batch_cancel_orders(cancels).await
+    }
+
+    /// Queries open algo orders (conditional orders).
+    ///
+    /// Returns all open algo orders, optionally filtered by symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn query_open_algo_orders(
+        &self,
+        instrument_id: Option<InstrumentId>,
+    ) -> BinanceFuturesHttpResult<Vec<BinanceFuturesAlgoOrder>> {
+        let symbol = instrument_id.map(|id| format_binance_symbol(&id));
+
+        let params = BinanceOpenAlgoOrdersParams {
+            symbol,
+            recv_window: None,
+        };
+
+        self.raw.query_open_algo_orders(&params).await
+    }
+
+    /// Queries a single algo order by client_order_id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn query_algo_order(
+        &self,
+        client_order_id: ClientOrderId,
+    ) -> BinanceFuturesHttpResult<BinanceFuturesAlgoOrder> {
+        let params = BinanceAlgoOrderQueryParams {
+            algo_id: None,
+            client_algo_id: Some(client_order_id.to_string()),
+            recv_window: None,
+        };
+
+        self.raw.query_algo_order(&params).await
     }
 
     /// Returns the size precision for an instrument from the cache.
@@ -1688,7 +2015,7 @@ impl BinanceFuturesHttpClient {
             let order_instrument_id = instrument_id.unwrap_or_else(|| {
                 // Build instrument ID from order symbol
                 let suffix = self.product_type.suffix();
-                InstrumentId::from(format!("{}{}.BINANCE", order.symbol, suffix).as_str())
+                InstrumentId::from(format!("{}{}.BINANCE", order.symbol, suffix))
             });
 
             let size_precision = self.get_size_precision(&order.symbol).unwrap_or(8); // Default precision if not in cache
@@ -1874,6 +2201,22 @@ impl BinanceFuturesHttpClient {
     }
 }
 
+/// Checks if an order type requires the Binance Algo Service API.
+///
+/// As of 2025-12-09, Binance migrated conditional order types to the Algo Service API.
+/// The traditional `/fapi/v1/order` endpoint returns error `-4120` for these types.
+#[must_use]
+pub fn is_algo_order_type(order_type: OrderType) -> bool {
+    matches!(
+        order_type,
+        OrderType::StopMarket
+            | OrderType::StopLimit
+            | OrderType::MarketIfTouched
+            | OrderType::LimitIfTouched
+            | OrderType::TrailingStopMarket
+    )
+}
+
 /// Converts a Nautilus order type to a Binance Futures order type.
 fn order_type_to_binance_futures(order_type: OrderType) -> anyhow::Result<BinanceFuturesOrderType> {
     match order_type {
@@ -1960,7 +2303,7 @@ mod tests {
                 assert_eq!(code, -1121);
                 assert_eq!(message, "Invalid symbol.");
             }
-            other => panic!("Expected BinanceError, got {other:?}"),
+            other => panic!("Expected BinanceError, was {other:?}"),
         }
     }
 }

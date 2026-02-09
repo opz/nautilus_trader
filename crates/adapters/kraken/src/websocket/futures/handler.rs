@@ -29,7 +29,8 @@ use nautilus_common::cache::quote::QuoteCache;
 use nautilus_core::{AtomicTime, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     data::{
-        BookOrder, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, TradeTick,
+        BookOrder, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta,
+        OrderBookDeltas, TradeTick,
     },
     enums::{
         AggressorSide, BookAction, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce,
@@ -46,6 +47,7 @@ use nautilus_network::{
     RECONNECTED,
     websocket::{SubscriptionState, WebSocketClient},
 };
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
@@ -57,7 +59,7 @@ use super::messages::{
     KrakenFuturesFillsDelta, KrakenFuturesMessageType, KrakenFuturesOpenOrder,
     KrakenFuturesOpenOrdersCancel, KrakenFuturesOpenOrdersDelta,
     KrakenFuturesPrivateSubscribeRequest, KrakenFuturesTickerData, KrakenFuturesTradeData,
-    KrakenFuturesTradeSnapshot, KrakenFuturesWsMessage, classify_futures_message,
+    KrakenFuturesWsMessage, classify_futures_message,
 };
 use crate::common::enums::KrakenOrderSide;
 
@@ -175,8 +177,8 @@ pub struct FuturesFeedHandler {
     api_key: Option<String>,
     original_challenge: Option<String>,
     signed_challenge: Option<String>,
-    client_order_cache: AHashMap<String, CachedOrderInfo>,
-    venue_order_cache: AHashMap<String, String>,
+    client_order_cache: AHashMap<ClientOrderId, CachedOrderInfo>,
+    venue_order_cache: AHashMap<VenueOrderId, ClientOrderId>,
     pending_challenge_tx: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
@@ -299,9 +301,8 @@ impl FuturesFeedHandler {
                             trader_id,
                             strategy_id,
                         } => {
-                            let client_order_id_str = client_order_id.to_string();
                             self.client_order_cache.insert(
-                                client_order_id_str.clone(),
+                                client_order_id,
                                 CachedOrderInfo {
                                     instrument_id,
                                     trader_id,
@@ -309,8 +310,7 @@ impl FuturesFeedHandler {
                                 },
                             );
                             if let Some(venue_id) = venue_order_id {
-                                self.venue_order_cache
-                                    .insert(venue_id.to_string(), client_order_id_str);
+                                self.venue_order_cache.insert(venue_id, client_order_id);
                             }
                         }
                     }
@@ -344,7 +344,7 @@ impl FuturesFeedHandler {
                             continue;
                         }
                         Message::Pong(_) => {
-                            log::trace!("Received pong");
+                            log::debug!("Received pong from server");
                             continue;
                         }
                         Message::Close(_) => {
@@ -517,7 +517,7 @@ impl FuturesFeedHandler {
                 self.handle_ticker_message_value(value, ts_init);
             }
             KrakenFuturesMessageType::TradeSnapshot => {
-                self.handle_trade_snapshot_value(value, ts_init);
+                log::debug!("Skipping trade_snapshot (only streaming live trades)");
             }
             KrakenFuturesMessageType::Trade => {
                 self.handle_trade_message_value(value, ts_init);
@@ -533,7 +533,7 @@ impl FuturesFeedHandler {
                 log::debug!("Received info message: {text}");
             }
             KrakenFuturesMessageType::Pong => {
-                log::trace!("Received pong response");
+                log::debug!("Received text pong response");
             }
             KrakenFuturesMessageType::Subscribed => {
                 log::debug!("Subscription confirmed: {text}");
@@ -547,8 +547,22 @@ impl FuturesFeedHandler {
             KrakenFuturesMessageType::Heartbeat => {
                 log::trace!("Heartbeat received");
             }
+            KrakenFuturesMessageType::Error => {
+                let message = value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown error");
+                log::error!("Kraken Futures WebSocket error: {message}");
+            }
+            KrakenFuturesMessageType::Alert => {
+                let message = value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown alert");
+                log::warn!("Kraken Futures WebSocket alert: {message}");
+            }
             KrakenFuturesMessageType::Unknown => {
-                log::debug!("Unhandled message: {text}");
+                log::warn!("Unhandled futures message: {text}");
             }
         }
     }
@@ -653,23 +667,50 @@ impl FuturesFeedHandler {
             self.pending_messages
                 .push_back(KrakenFuturesWsMessage::IndexPrice(update));
         }
+
+        let has_funding = self.is_subscribed(KrakenFuturesChannel::Funding, &ticker.product_id);
+
+        if let Some(funding_rate) = ticker.funding_rate
+            && has_funding
+        {
+            let next_funding_ns = ticker
+                .next_funding_rate_time
+                .map(|t| UnixNanos::from((t as u64) * 1_000_000));
+            let update = FundingRateUpdate::new(
+                instrument_id,
+                Decimal::from_f64_retain(funding_rate).unwrap_or_default(),
+                next_funding_ns,
+                ts_event,
+                ts_init,
+            );
+            self.pending_messages
+                .push_back(KrakenFuturesWsMessage::FundingRate(update));
+        }
     }
 
     fn handle_trade_message_value(&mut self, value: Value, ts_init: UnixNanos) {
         let trade = match serde_json::from_value::<KrakenFuturesTradeData>(value) {
             Ok(t) => t,
             Err(e) => {
-                log::trace!("Failed to parse trade: {e}");
+                log::warn!("Failed to parse trade: {e}");
                 return;
             }
         };
 
         if !self.is_subscribed(KrakenFuturesChannel::Trades, &trade.product_id) {
+            log::warn!(
+                "Received trade for unsubscribed product: {}",
+                trade.product_id
+            );
             return;
         }
 
         let (instrument_id, price_precision, size_precision) = {
             let Some(instrument) = self.get_instrument(&trade.product_id) else {
+                log::warn!(
+                    "No instrument found for trade product: {}",
+                    trade.product_id
+                );
                 return;
             };
             (
@@ -708,68 +749,11 @@ impl FuturesFeedHandler {
             .push_back(KrakenFuturesWsMessage::Trade(trade_tick));
     }
 
-    fn handle_trade_snapshot_value(&mut self, value: Value, ts_init: UnixNanos) {
-        let snapshot = match serde_json::from_value::<KrakenFuturesTradeSnapshot>(value) {
-            Ok(s) => s,
-            Err(e) => {
-                log::trace!("Failed to parse trade snapshot: {e}");
-                return;
-            }
-        };
-
-        if !self.is_subscribed(KrakenFuturesChannel::Trades, &snapshot.product_id) {
-            return;
-        }
-
-        let (instrument_id, price_precision, size_precision) = {
-            let Some(instrument) = self.get_instrument(&snapshot.product_id) else {
-                return;
-            };
-            (
-                instrument.id(),
-                instrument.price_precision(),
-                instrument.size_precision(),
-            )
-        };
-
-        for trade in snapshot.trades {
-            let size = Quantity::new(trade.qty, size_precision);
-            if size.is_zero() {
-                let product_id = snapshot.product_id;
-                let raw_qty = trade.qty;
-                log::warn!(
-                    "Skipping zero quantity trade in snapshot for {product_id} (raw qty: {raw_qty})"
-                );
-                continue;
-            }
-
-            let ts_event = UnixNanos::from((trade.time as u64) * 1_000_000);
-            let aggressor_side = match trade.side {
-                KrakenOrderSide::Buy => AggressorSide::Buyer,
-                KrakenOrderSide::Sell => AggressorSide::Seller,
-            };
-            let trade_id = trade.uid.unwrap_or_else(|| trade.seq.to_string());
-
-            let trade_tick = TradeTick::new(
-                instrument_id,
-                Price::new(trade.price, price_precision),
-                size,
-                aggressor_side,
-                TradeId::new(&trade_id),
-                ts_event,
-                ts_init,
-            );
-
-            self.pending_messages
-                .push_back(KrakenFuturesWsMessage::Trade(trade_tick));
-        }
-    }
-
     fn handle_book_snapshot_value(&mut self, value: Value, ts_init: UnixNanos) {
         let snapshot = match serde_json::from_value::<KrakenFuturesBookSnapshot>(value) {
             Ok(s) => s,
             Err(e) => {
-                log::trace!("Failed to parse book snapshot: {e}");
+                log::warn!("Failed to parse book snapshot: {e}");
                 return;
             }
         };
@@ -778,11 +762,19 @@ impl FuturesFeedHandler {
         let has_quotes = self.is_subscribed(KrakenFuturesChannel::Quotes, &snapshot.product_id);
 
         if !has_book && !has_quotes {
+            log::warn!(
+                "Received book snapshot for unsubscribed product: {}",
+                snapshot.product_id
+            );
             return;
         }
 
         let (instrument_id, price_precision, size_precision) = {
             let Some(instrument) = self.get_instrument(&snapshot.product_id) else {
+                log::warn!(
+                    "No instrument found for book snapshot product: {}",
+                    snapshot.product_id
+                );
                 return;
             };
             (
@@ -894,7 +886,7 @@ impl FuturesFeedHandler {
         let delta = match serde_json::from_value::<KrakenFuturesBookDelta>(value) {
             Ok(d) => d,
             Err(e) => {
-                log::trace!("Failed to parse book delta: {e}");
+                log::warn!("Failed to parse book delta: {e}");
                 return;
             }
         };
@@ -903,10 +895,18 @@ impl FuturesFeedHandler {
         let has_quotes = self.is_subscribed(KrakenFuturesChannel::Quotes, &delta.product_id);
 
         if !has_book && !has_quotes {
+            log::warn!(
+                "Received book delta for unsubscribed product: {}",
+                delta.product_id
+            );
             return;
         }
 
         let Some(instrument) = self.get_instrument(&delta.product_id) else {
+            log::warn!(
+                "No instrument found for book delta product: {}",
+                delta.product_id
+            );
             return;
         };
 
@@ -1025,12 +1025,18 @@ impl FuturesFeedHandler {
             return;
         };
 
-        let (client_order_id, info) = if let Some(cli_ord_id) = cancel.cli_ord_id.as_ref() {
-            if let Some(info) = self.client_order_cache.get(cli_ord_id) {
-                (ClientOrderId::new(cli_ord_id), info.clone())
-            } else if let Some(mapped_cli_ord_id) = self.venue_order_cache.get(&cancel.order_id) {
+        let venue_order_id_key = VenueOrderId::new(&cancel.order_id);
+
+        let (client_order_id, info) = if let Some(cli_ord_id) =
+            cancel.cli_ord_id.as_ref().filter(|id| !id.is_empty())
+        {
+            let client_order_id_key = ClientOrderId::new(cli_ord_id);
+            if let Some(info) = self.client_order_cache.get(&client_order_id_key) {
+                (client_order_id_key, info.clone())
+            } else if let Some(mapped_cli_ord_id) = self.venue_order_cache.get(&venue_order_id_key)
+            {
                 if let Some(info) = self.client_order_cache.get(mapped_cli_ord_id) {
-                    (ClientOrderId::new(mapped_cli_ord_id), info.clone())
+                    (*mapped_cli_ord_id, info.clone())
                 } else {
                     log::debug!(
                         "Cancel received for unknown order (not in cache): \
@@ -1047,9 +1053,9 @@ impl FuturesFeedHandler {
                 );
                 return;
             }
-        } else if let Some(mapped_cli_ord_id) = self.venue_order_cache.get(&cancel.order_id) {
+        } else if let Some(mapped_cli_ord_id) = self.venue_order_cache.get(&venue_order_id_key) {
             if let Some(info) = self.client_order_cache.get(mapped_cli_ord_id) {
-                (ClientOrderId::new(mapped_cli_ord_id), info.clone())
+                (*mapped_cli_ord_id, info.clone())
             } else {
                 log::debug!(
                     "Cancel received but mapped order not in cache: order_id={}",
@@ -1128,9 +1134,7 @@ impl FuturesFeedHandler {
             return None;
         };
 
-        let instrument = self
-            .instruments_cache
-            .get(&Ustr::from(order.instrument.as_str()))?;
+        let instrument = self.instruments_cache.get(&order.instrument)?;
 
         let instrument_id = instrument.id();
 
@@ -1149,12 +1153,14 @@ impl FuturesFeedHandler {
         let client_order_id = order
             .cli_ord_id
             .as_ref()
+            .filter(|s| !s.is_empty())
             .map(|s| ClientOrderId::new(s.as_str()));
 
         let cached_info = order
             .cli_ord_id
             .as_ref()
-            .and_then(|id| self.client_order_cache.get(id));
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.client_order_cache.get(&ClientOrderId::new(id)));
 
         // External orders or snapshots fall back to OrderStatusReport for reconciliation
         let Some(info) = cached_info else {
@@ -1165,12 +1171,14 @@ impl FuturesFeedHandler {
 
         let client_order_id = client_order_id.expect("client_order_id should exist if cached");
 
-        let status = if is_cancel {
-            OrderStatus::Canceled
-        } else if order.filled >= order.qty {
+        // Check fill status first - a fully filled order should be Filled even if is_cancel=true
+        // (Kraken sends is_cancel=true with reason=full_fill for completed orders)
+        let status = if order.filled >= order.qty && order.qty > 0.0 {
             OrderStatus::Filled
         } else if order.filled > 0.0 {
             OrderStatus::PartiallyFilled
+        } else if is_cancel {
+            OrderStatus::Canceled
         } else {
             OrderStatus::Accepted
         };
@@ -1250,9 +1258,7 @@ impl FuturesFeedHandler {
             return None;
         };
 
-        let instrument = self
-            .instruments_cache
-            .get(&Ustr::from(order.instrument.as_str()))?;
+        let instrument = self.instruments_cache.get(&order.instrument)?;
 
         let instrument_id = instrument.id();
         let size_precision = instrument.size_precision();
@@ -1271,16 +1277,6 @@ impl FuturesFeedHandler {
             _ => OrderType::Limit,
         };
 
-        let status = if is_cancel {
-            OrderStatus::Canceled
-        } else if order.filled >= order.qty {
-            OrderStatus::Filled
-        } else if order.filled > 0.0 {
-            OrderStatus::PartiallyFilled
-        } else {
-            OrderStatus::Accepted
-        };
-
         if order.qty <= 0.0 {
             log::warn!(
                 "Skipping order with invalid quantity: order_id={}, qty={}",
@@ -1290,11 +1286,23 @@ impl FuturesFeedHandler {
             return None;
         }
 
+        // Check fill status first - a fully filled order should be Filled even if is_cancel=true
+        let status = if order.filled >= order.qty {
+            OrderStatus::Filled
+        } else if order.filled > 0.0 {
+            OrderStatus::PartiallyFilled
+        } else if is_cancel {
+            OrderStatus::Canceled
+        } else {
+            OrderStatus::Accepted
+        };
+
         let ts_event = UnixNanos::from((order.last_update_time as u64) * 1_000_000);
 
         let client_order_id = order
             .cli_ord_id
             .as_ref()
+            .filter(|s| !s.is_empty())
             .map(|s| ClientOrderId::new(s.as_str()));
 
         let filled_qty = if order.filled <= 0.0 {
@@ -1334,14 +1342,16 @@ impl FuturesFeedHandler {
         // Resolve instrument: try message field first, then fall back to cache
         let instrument = if let Some(ref symbol) = fill.instrument {
             self.instruments_cache.get(symbol).cloned()
-        } else if let Some(ref cli_ord_id) = fill.cli_ord_id {
+        } else if let Some(ref cli_ord_id) = fill.cli_ord_id.as_ref().filter(|id| !id.is_empty()) {
             // Fall back to client order cache
-            self.client_order_cache.get(cli_ord_id).and_then(|info| {
-                self.instruments_cache
-                    .iter()
-                    .find(|(_, inst)| inst.id() == info.instrument_id)
-                    .map(|(_, inst)| inst.clone())
-            })
+            self.client_order_cache
+                .get(&ClientOrderId::new(cli_ord_id))
+                .and_then(|info| {
+                    self.instruments_cache
+                        .iter()
+                        .find(|(_, inst)| inst.id() == info.instrument_id)
+                        .map(|(_, inst)| inst.clone())
+                })
         } else {
             None
         };
@@ -1380,6 +1390,7 @@ impl FuturesFeedHandler {
         let client_order_id = fill
             .cli_ord_id
             .as_ref()
+            .filter(|s| !s.is_empty())
             .map(|s| ClientOrderId::new(s.as_str()));
 
         let commission = Money::new(fill.fee_paid.unwrap_or(0.0), instrument.quote_currency());

@@ -13,14 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
 use nautilus_common::{
     live::runner::{set_data_event_sender, set_exec_event_sender},
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport, data::DataCommand, execution::TradingCommand,
     },
-    msgbus::{self, switchboard::MessagingSwitchboard},
+    msgbus::{self, MessagingSwitchboard},
     runner::{
         DataCommandSender, TimeEventSender, TradingCommandSender, set_data_cmd_sender,
         set_exec_cmd_sender, set_time_event_sender,
@@ -263,7 +263,7 @@ impl AsyncRunner {
     /// Handles a data command by sending to the DataEngine.
     #[inline]
     pub fn handle_data_command(cmd: DataCommand) {
-        msgbus::send_any(MessagingSwitchboard::data_engine_execute(), &cmd);
+        msgbus::send_data_command(MessagingSwitchboard::data_engine_execute(), cmd);
     }
 
     /// Handles a data event by sending to the appropriate DataEngine endpoint.
@@ -271,20 +271,20 @@ impl AsyncRunner {
     pub fn handle_data_event(event: DataEvent) {
         match event {
             DataEvent::Data(data) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &data);
+                msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
             }
             DataEvent::Instrument(data) => {
                 msgbus::send_any(MessagingSwitchboard::data_engine_process(), &data);
             }
             DataEvent::Response(resp) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_response(), &resp);
+                msgbus::send_data_response(MessagingSwitchboard::data_engine_response(), resp);
             }
             DataEvent::FundingRate(funding_rate) => {
                 msgbus::send_any(MessagingSwitchboard::data_engine_process(), &funding_rate);
             }
             #[cfg(feature = "defi")]
             DataEvent::DeFi(data) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &data);
+                msgbus::send_defi_data(MessagingSwitchboard::data_engine_process_defi_data(), data);
             }
         }
     }
@@ -292,21 +292,24 @@ impl AsyncRunner {
     /// Handles an execution command by sending to the ExecEngine.
     #[inline]
     pub fn handle_exec_command(cmd: TradingCommand) {
-        msgbus::send_any(MessagingSwitchboard::exec_engine_execute(), &cmd);
+        msgbus::send_trading_command(MessagingSwitchboard::exec_engine_execute(), cmd);
     }
 
     /// Handles an execution event by sending to the appropriate engine endpoint.
     #[inline]
     pub fn handle_exec_event(event: ExecutionEvent) {
         match event {
-            ExecutionEvent::Order(ref order_event) => {
-                msgbus::send_any(MessagingSwitchboard::exec_engine_process(), order_event);
+            ExecutionEvent::Order(order_event) => {
+                msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
             }
             ExecutionEvent::Report(report) => {
                 Self::handle_exec_report(report);
             }
             ExecutionEvent::Account(ref account) => {
-                msgbus::send_any(MessagingSwitchboard::portfolio_update_account(), account);
+                msgbus::send_account_state(
+                    MessagingSwitchboard::portfolio_update_account(),
+                    account,
+                );
             }
         }
     }
@@ -314,7 +317,7 @@ impl AsyncRunner {
     #[inline]
     pub fn handle_exec_report(report: ExecutionReport) {
         let endpoint = MessagingSwitchboard::exec_engine_reconcile_execution_report();
-        msgbus::send_any(endpoint, &report as &dyn Any);
+        msgbus::send_execution_report(endpoint, report);
     }
 }
 
@@ -326,7 +329,7 @@ mod tests {
         messages::{
             ExecutionEvent, ExecutionReport,
             data::{SubscribeCommand, SubscribeCustomData},
-            execution::TradingCommand,
+            execution::{CancelAllOrders, TradingCommand},
         },
         timer::{TimeEvent, TimeEventCallback, TimeEventHandler},
     };
@@ -618,6 +621,124 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let sender = AsyncTradingCommandSender::new(tx);
         assert!(format!("{sender:?}").contains("AsyncTradingCommandSender"));
+    }
+
+    #[tokio::test]
+    async fn test_async_trading_command_sender_execute() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TradingCommand>();
+        let sender = AsyncTradingCommandSender::new(tx);
+
+        let command = TradingCommand::CancelAllOrders(CancelAllOrders::new(
+            TraderId::from("TRADER-001"),
+            None,
+            StrategyId::from("S-001"),
+            InstrumentId::from("EUR/USD.SIM"),
+            OrderSide::Buy,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ));
+
+        sender.execute(command);
+
+        let received = rx.recv().await;
+        assert!(received.is_some());
+        assert!(matches!(
+            received.unwrap(),
+            TradingCommand::CancelAllOrders(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_runner_processes_trading_commands() {
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (_time_evt_tx, time_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TimeEventHandler>();
+        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<TradingCommand>();
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let mut runner = create_test_runner(
+            time_evt_rx,
+            data_evt_rx,
+            data_cmd_rx,
+            exec_evt_rx,
+            exec_cmd_rx,
+            signal_rx,
+            signal_tx.clone(),
+        );
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        let command = TradingCommand::CancelAllOrders(CancelAllOrders::new(
+            TraderId::from("TRADER-001"),
+            None,
+            StrategyId::from("S-001"),
+            InstrumentId::from("EUR/USD.SIM"),
+            OrderSide::Buy,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ));
+        exec_cmd_tx.send(command).unwrap();
+
+        tokio::task::yield_now().await;
+        signal_tx.send(()).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), runner_handle).await;
+        assert!(result.is_ok(), "Runner should process command and stop");
+    }
+
+    #[tokio::test]
+    async fn test_runner_processes_multiple_trading_commands() {
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (_time_evt_tx, time_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TimeEventHandler>();
+        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<TradingCommand>();
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let mut runner = create_test_runner(
+            time_evt_rx,
+            data_evt_rx,
+            data_cmd_rx,
+            exec_evt_rx,
+            exec_cmd_rx,
+            signal_rx,
+            signal_tx.clone(),
+        );
+
+        let runner_handle = tokio::spawn(async move {
+            runner.run().await;
+        });
+
+        for i in 0..10 {
+            let strategy_id = format!("S-{i:03}");
+            let command = TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                TraderId::from("TRADER-001"),
+                None,
+                StrategyId::from(strategy_id.as_str()),
+                InstrumentId::from("EUR/USD.SIM"),
+                OrderSide::Buy,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+            ));
+            exec_cmd_tx.send(command).unwrap();
+        }
+
+        tokio::task::yield_now().await;
+        signal_tx.send(()).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), runner_handle).await;
+        assert!(
+            result.is_ok(),
+            "Runner should process all commands and stop"
+        );
     }
 
     #[tokio::test]

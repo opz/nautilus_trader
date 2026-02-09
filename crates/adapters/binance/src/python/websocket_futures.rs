@@ -27,7 +27,8 @@ use pyo3::prelude::*;
 use crate::{
     common::enums::{BinanceEnvironment, BinanceProductType},
     futures::websocket::{
-        client::BinanceFuturesWebSocketClient, messages::NautilusFuturesWsMessage,
+        client::BinanceFuturesWebSocketClient,
+        messages::{NautilusDataWsMessage, NautilusWsMessage},
     },
 };
 
@@ -99,34 +100,37 @@ impl BinanceFuturesWebSocketClient {
 
                 while let Some(msg) = stream.next().await {
                     match msg {
-                        NautilusFuturesWsMessage::Data(data_vec) => {
-                            Python::attach(|py| {
-                                for data in data_vec {
-                                    let py_obj = data_to_pycapsule(py, data);
+                        NautilusWsMessage::Data(data_msg) => match data_msg {
+                            NautilusDataWsMessage::Data(data_vec) => {
+                                Python::attach(|py| {
+                                    for data in data_vec {
+                                        let py_obj = data_to_pycapsule(py, data);
+                                        call_python(py, &callback, py_obj);
+                                    }
+                                });
+                            }
+                            NautilusDataWsMessage::DepthUpdate { deltas, .. } => {
+                                Python::attach(|py| {
+                                    let py_obj = data_to_pycapsule(
+                                        py,
+                                        Data::Deltas(OrderBookDeltas_API::new(deltas)),
+                                    );
                                     call_python(py, &callback, py_obj);
-                                }
-                            });
-                        }
-                        NautilusFuturesWsMessage::Deltas(deltas) => {
-                            Python::attach(|py| {
-                                let py_obj = data_to_pycapsule(
-                                    py,
-                                    Data::Deltas(OrderBookDeltas_API::new(deltas)),
-                                );
-                                call_python(py, &callback, py_obj);
-                            });
-                        }
-                        NautilusFuturesWsMessage::Error(err) => {
+                                });
+                            }
+                            _ => {}
+                        },
+                        NautilusWsMessage::Exec(_) | NautilusWsMessage::ExecRaw(_) => {}
+                        NautilusWsMessage::Error(err) => {
                             log::warn!(
                                 "Binance WebSocket error: code={}, msg={}",
                                 err.code,
                                 err.msg
                             );
                         }
-                        NautilusFuturesWsMessage::Reconnected => {
+                        NautilusWsMessage::Reconnected => {
                             log::info!("Binance Futures WebSocket reconnected");
                         }
-                        _ => {}
                     }
                 }
             });

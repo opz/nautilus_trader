@@ -49,6 +49,7 @@ use nautilus_model::{
     identifiers::{InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
+    orders::OrderAny,
     types::{AccountBalance, Currency, Money, Price},
 };
 use rust_decimal::Decimal;
@@ -447,8 +448,8 @@ impl SimulatedExchange {
                 match account.balance(Some(adjustment.currency)) {
                     Some(balance) => {
                         let mut current_balance = *balance;
-                        current_balance.total += adjustment;
-                        current_balance.free += adjustment;
+                        current_balance.total = current_balance.total + adjustment;
+                        current_balance.free = current_balance.free + adjustment;
 
                         let margins = match account {
                             AccountAny::Margin(margin_account) => margin_account.margins.clone(),
@@ -777,8 +778,13 @@ impl SimulatedExchange {
                 TradingCommand::BatchCancelOrders(ref command) => {
                     matching_engine.process_batch_cancel(command, account_id);
                 }
-                TradingCommand::SubmitOrderList(mut command) => {
-                    for order in &mut command.order_list.orders {
+                TradingCommand::SubmitOrderList(ref command) => {
+                    let mut orders: Vec<OrderAny> = self
+                        .cache
+                        .borrow()
+                        .orders_for_ids(&command.order_list.client_order_ids, command);
+
+                    for order in &mut orders {
                         matching_engine.process_order(order, account_id);
                     }
                 }
@@ -829,10 +835,7 @@ mod tests {
         cache::Cache,
         clock::TestClock,
         messages::execution::{SubmitOrder, TradingCommand},
-        msgbus::{
-            self,
-            stubs::{get_message_saving_handler, get_saved_messages},
-        },
+        msgbus::{self, stubs::get_typed_message_saving_handler},
     };
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_execution::models::{
@@ -1317,8 +1320,8 @@ mod tests {
     fn test_accounting() {
         let account_type = AccountType::Margin;
         let mut cache = Cache::default();
-        let handler = get_message_saving_handler::<AccountState>(None);
-        msgbus::register("Portfolio.update_account".into(), handler.clone());
+        let (handler, saving_handler) = get_typed_message_saving_handler::<AccountState>(None);
+        msgbus::register_account_state_endpoint("Portfolio.update_account".into(), handler);
         let margin_account = MarginAccount::new(
             AccountState::new(
                 AccountId::from("SIM-001"),
@@ -1355,7 +1358,7 @@ mod tests {
         exchange.borrow_mut().adjust_account(Money::from("500 USD"));
 
         // Check if we received two messages, one for initial account state and one for adjusted account state
-        let messages = get_saved_messages::<AccountState>(handler);
+        let messages = saving_handler.get_messages();
         assert_eq!(messages.len(), 2);
         let account_state_first = messages.first().unwrap();
         let account_state_second = messages.last().unwrap();

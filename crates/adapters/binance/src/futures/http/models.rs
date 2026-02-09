@@ -31,9 +31,10 @@ use ustr::Ustr;
 
 use crate::common::{
     enums::{
-        BinanceContractStatus, BinanceFuturesOrderType, BinanceIncomeType, BinanceMarginType,
-        BinanceOrderStatus, BinancePositionSide, BinancePriceMatch, BinanceSelfTradePreventionMode,
-        BinanceSide, BinanceTimeInForce, BinanceTradingStatus, BinanceWorkingType,
+        BinanceAlgoStatus, BinanceAlgoType, BinanceContractStatus, BinanceFuturesOrderType,
+        BinanceIncomeType, BinanceMarginType, BinanceOrderStatus, BinancePositionSide,
+        BinancePriceMatch, BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce,
+        BinanceTradingStatus, BinanceWorkingType,
     },
     models::BinanceRateLimit,
 };
@@ -442,8 +443,27 @@ pub struct BinanceFuturesBalance {
     pub account_alias: Option<String>,
     /// Asset code (e.g., "USDT").
     pub asset: Ustr,
-    /// Total balance.
-    pub balance: String,
+    /// Wallet balance (v2 uses walletBalance, v1 uses balance).
+    #[serde(alias = "balance")]
+    pub wallet_balance: String,
+    /// Unrealized profit.
+    #[serde(default)]
+    pub unrealized_profit: Option<String>,
+    /// Margin balance.
+    #[serde(default)]
+    pub margin_balance: Option<String>,
+    /// Maintenance margin required.
+    #[serde(default)]
+    pub maint_margin: Option<String>,
+    /// Initial margin required.
+    #[serde(default)]
+    pub initial_margin: Option<String>,
+    /// Position initial margin.
+    #[serde(default)]
+    pub position_initial_margin: Option<String>,
+    /// Open order initial margin.
+    #[serde(default)]
+    pub open_order_initial_margin: Option<String>,
     /// Cross wallet balance.
     #[serde(default)]
     pub cross_wallet_balance: Option<String>,
@@ -465,7 +485,57 @@ pub struct BinanceFuturesBalance {
     pub withdraw_available: Option<String>,
 }
 
-/// Position risk record.
+/// Account position from `GET /fapi/v2/account` positions array.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceAccountPosition {
+    /// Symbol name.
+    pub symbol: Ustr,
+    /// Initial margin.
+    #[serde(default)]
+    pub initial_margin: Option<String>,
+    /// Maintenance margin.
+    #[serde(default)]
+    pub maint_margin: Option<String>,
+    /// Unrealized profit.
+    #[serde(default)]
+    pub unrealized_profit: Option<String>,
+    /// Position initial margin.
+    #[serde(default)]
+    pub position_initial_margin: Option<String>,
+    /// Open order initial margin.
+    #[serde(default)]
+    pub open_order_initial_margin: Option<String>,
+    /// Leverage.
+    #[serde(default)]
+    pub leverage: Option<String>,
+    /// Isolated margin mode.
+    #[serde(default)]
+    pub isolated: Option<bool>,
+    /// Entry price.
+    #[serde(default)]
+    pub entry_price: Option<String>,
+    /// Max notional value.
+    #[serde(default)]
+    pub max_notional: Option<String>,
+    /// Bid notional.
+    #[serde(default)]
+    pub bid_notional: Option<String>,
+    /// Ask notional.
+    #[serde(default)]
+    pub ask_notional: Option<String>,
+    /// Position side (BOTH, LONG, SHORT).
+    #[serde(default)]
+    pub position_side: Option<BinancePositionSide>,
+    /// Position amount.
+    #[serde(default)]
+    pub position_amt: Option<String>,
+    /// Update time.
+    #[serde(default)]
+    pub update_time: Option<i64>,
+}
+
+/// Position risk from `GET /fapi/v2/positionRisk`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BinancePositionRisk {
@@ -494,9 +564,9 @@ pub struct BinancePositionRisk {
     /// Isolated margin amount.
     #[serde(default)]
     pub isolated_margin: Option<String>,
-    /// Auto add margin flag.
+    /// Auto add margin flag (as string from API).
     #[serde(default)]
-    pub is_auto_add_margin: Option<bool>,
+    pub is_auto_add_margin: Option<String>,
     /// Position side (BOTH, LONG, SHORT).
     #[serde(default)]
     pub position_side: Option<BinancePositionSide>,
@@ -587,7 +657,7 @@ pub struct BinanceUserTrade {
     pub margin_asset: Option<Ustr>,
 }
 
-/// Futures account information from `GET /fapi/v3/account`.
+/// Futures account information from `GET /fapi/v2/account` or `GET /dapi/v1/account`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BinanceFuturesAccountInfo {
@@ -644,7 +714,7 @@ pub struct BinanceFuturesAccountInfo {
     pub assets: Vec<BinanceFuturesBalance>,
     /// Account positions.
     #[serde(default)]
-    pub positions: Vec<BinancePositionRisk>,
+    pub positions: Vec<BinanceAccountPosition>,
 }
 
 impl BinanceFuturesAccountInfo {
@@ -666,7 +736,7 @@ impl BinanceFuturesAccountInfo {
                 Some("futures balance"),
             );
 
-            let total: Decimal = asset.balance.parse().context("invalid balance")?;
+            let total: Decimal = asset.wallet_balance.parse().context("invalid balance")?;
             let available: Decimal = asset
                 .available_balance
                 .parse()
@@ -1052,4 +1122,525 @@ pub struct BatchOrderError {
 pub struct ListenKeyResponse {
     /// The listen key for WebSocket user data stream.
     pub listen_key: String,
+}
+
+/// Algo order response from Binance Futures Algo Service API.
+///
+/// Algo orders are conditional orders (STOP_MARKET, STOP_LIMIT, TAKE_PROFIT,
+/// TAKE_PROFIT_MARKET, TRAILING_STOP_MARKET) that are managed by Binance's
+/// Algo Service rather than the traditional order matching engine.
+///
+/// # References
+///
+/// - <https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceFuturesAlgoOrder {
+    /// Unique algo order ID assigned by Binance.
+    pub algo_id: i64,
+    /// Client-specified algo order ID for idempotency.
+    pub client_algo_id: String,
+    /// Algo type (currently only `Conditional` is supported).
+    pub algo_type: BinanceAlgoType,
+    /// Order type (STOP_MARKET, STOP, TAKE_PROFIT, TAKE_PROFIT_MARKET, TRAILING_STOP_MARKET).
+    #[serde(rename = "type")]
+    pub order_type: BinanceFuturesOrderType,
+    /// Trading symbol.
+    pub symbol: Ustr,
+    /// Order side (BUY/SELL).
+    pub side: BinanceSide,
+    /// Position side (BOTH, LONG, SHORT).
+    #[serde(default)]
+    pub position_side: Option<BinancePositionSide>,
+    /// Time in force.
+    #[serde(default)]
+    pub time_in_force: Option<BinanceTimeInForce>,
+    /// Order quantity.
+    #[serde(default)]
+    pub quantity: Option<String>,
+    /// Algo order status.
+    #[serde(default)]
+    pub algo_status: Option<BinanceAlgoStatus>,
+    /// Trigger price for the conditional order.
+    #[serde(default)]
+    pub trigger_price: Option<String>,
+    /// Limit price (for STOP/TAKE_PROFIT limit orders).
+    #[serde(default)]
+    pub price: Option<String>,
+    /// Working type for trigger price calculation (CONTRACT_PRICE or MARK_PRICE).
+    #[serde(default)]
+    pub working_type: Option<BinanceWorkingType>,
+    /// Close all position flag.
+    #[serde(default)]
+    pub close_position: Option<bool>,
+    /// Price protection enabled.
+    #[serde(default)]
+    pub price_protect: Option<bool>,
+    /// Reduce-only flag.
+    #[serde(default)]
+    pub reduce_only: Option<bool>,
+    /// Activation price for TRAILING_STOP_MARKET orders.
+    #[serde(default)]
+    pub activate_price: Option<String>,
+    /// Callback rate for TRAILING_STOP_MARKET orders (0.1 to 10, where 1 = 1%).
+    #[serde(default)]
+    pub callback_rate: Option<String>,
+    /// Order creation time in milliseconds.
+    #[serde(default)]
+    pub create_time: Option<i64>,
+    /// Last update time in milliseconds.
+    #[serde(default)]
+    pub update_time: Option<i64>,
+    /// Trigger time in milliseconds (when the algo order triggered).
+    #[serde(default)]
+    pub trigger_time: Option<i64>,
+    /// Order ID in matching engine (populated when algo order is triggered).
+    #[serde(default)]
+    pub actual_order_id: Option<String>,
+    /// Executed quantity in matching engine (populated when algo order is triggered).
+    #[serde(default)]
+    pub executed_qty: Option<String>,
+    /// Average fill price in matching engine (populated when algo order is triggered).
+    #[serde(default)]
+    pub avg_price: Option<String>,
+}
+
+impl BinanceFuturesAlgoOrder {
+    /// Converts this Binance algo order to a Nautilus [`OrderStatusReport`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if quantity parsing fails.
+    pub fn to_order_status_report(
+        &self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        size_precision: u8,
+    ) -> anyhow::Result<OrderStatusReport> {
+        let ts_now = get_atomic_clock_realtime().get_time_ns();
+        let ts_event = self
+            .update_time
+            .or(self.create_time)
+            .map_or(ts_now, |t| UnixNanos::from((t * 1_000_000) as u64));
+
+        let client_order_id = ClientOrderId::new(&self.client_algo_id);
+        let venue_order_id = self.actual_order_id.as_ref().map_or_else(
+            || VenueOrderId::new(self.algo_id.to_string()),
+            |id| VenueOrderId::new(id.clone()),
+        );
+
+        let order_side = match self.side {
+            BinanceSide::Buy => OrderSide::Buy,
+            BinanceSide::Sell => OrderSide::Sell,
+        };
+
+        let order_type = self.parse_order_type();
+        let time_in_force = self
+            .time_in_force
+            .as_ref()
+            .map_or(TimeInForce::Gtc, |tif| tif.to_nautilus_time_in_force());
+        let order_status = self.parse_order_status();
+
+        let quantity: Decimal = self
+            .quantity
+            .as_ref()
+            .map_or(Ok(Decimal::ZERO), |q| q.parse())
+            .context("invalid quantity")?;
+        let filled_qty: Decimal = self
+            .executed_qty
+            .as_ref()
+            .map_or(Ok(Decimal::ZERO), |q| q.parse())
+            .context("invalid executed_qty")?;
+
+        Ok(OrderStatusReport::new(
+            account_id,
+            instrument_id,
+            Some(client_order_id),
+            venue_order_id,
+            order_side,
+            order_type,
+            time_in_force,
+            order_status,
+            Quantity::new(quantity.to_string().parse()?, size_precision),
+            Quantity::new(filled_qty.to_string().parse()?, size_precision),
+            ts_event,
+            ts_event,
+            ts_now,
+            Some(UUID4::new()),
+        ))
+    }
+
+    fn parse_order_type(&self) -> OrderType {
+        self.order_type.into()
+    }
+
+    fn parse_order_status(&self) -> OrderStatus {
+        match self.algo_status {
+            Some(BinanceAlgoStatus::New) => OrderStatus::Accepted,
+            Some(BinanceAlgoStatus::Triggering) => OrderStatus::Accepted,
+            Some(BinanceAlgoStatus::Triggered) => OrderStatus::Accepted,
+            Some(BinanceAlgoStatus::Finished) => {
+                // Check executed_qty to determine if filled or canceled
+                if let Some(qty) = &self.executed_qty
+                    && let Ok(dec) = qty.parse::<Decimal>()
+                    && !dec.is_zero()
+                {
+                    return OrderStatus::Filled;
+                }
+                OrderStatus::Canceled
+            }
+            Some(BinanceAlgoStatus::Canceled) => OrderStatus::Canceled,
+            Some(BinanceAlgoStatus::Expired) => OrderStatus::Expired,
+            Some(BinanceAlgoStatus::Rejected) => OrderStatus::Rejected,
+            Some(BinanceAlgoStatus::Unknown) | None => OrderStatus::Initialized,
+        }
+    }
+}
+
+/// Cancel response for algo orders from Binance Futures Algo Service API.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceFuturesAlgoOrderCancelResponse {
+    /// Algo order ID that was canceled.
+    pub algo_id: i64,
+    /// Client algo order ID.
+    pub client_algo_id: String,
+    /// Response code (200 for success).
+    pub code: i32,
+    /// Response message.
+    pub msg: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    /// Test fixture from Binance API docs for GET /fapi/v2/account
+    const ACCOUNT_INFO_V2_JSON: &str = r#"{
+        "feeTier": 0,
+        "canTrade": true,
+        "canDeposit": true,
+        "canWithdraw": true,
+        "updateTime": 0,
+        "multiAssetsMargin": false,
+        "tradeGroupId": -1,
+        "totalInitialMargin": "0.00000000",
+        "totalMaintMargin": "0.00000000",
+        "totalWalletBalance": "23.72469206",
+        "totalUnrealizedProfit": "0.00000000",
+        "totalMarginBalance": "23.72469206",
+        "totalPositionInitialMargin": "0.00000000",
+        "totalOpenOrderInitialMargin": "0.00000000",
+        "totalCrossWalletBalance": "23.72469206",
+        "totalCrossUnPnl": "0.00000000",
+        "availableBalance": "23.72469206",
+        "maxWithdrawAmount": "23.72469206",
+        "assets": [
+            {
+                "asset": "USDT",
+                "walletBalance": "23.72469206",
+                "unrealizedProfit": "0.00000000",
+                "marginBalance": "23.72469206",
+                "maintMargin": "0.00000000",
+                "initialMargin": "0.00000000",
+                "positionInitialMargin": "0.00000000",
+                "openOrderInitialMargin": "0.00000000",
+                "crossWalletBalance": "23.72469206",
+                "crossUnPnl": "0.00000000",
+                "availableBalance": "23.72469206",
+                "maxWithdrawAmount": "23.72469206",
+                "marginAvailable": true,
+                "updateTime": 1625474304765
+            }
+        ],
+        "positions": [
+            {
+                "symbol": "BTCUSDT",
+                "initialMargin": "0",
+                "maintMargin": "0",
+                "unrealizedProfit": "0.00000000",
+                "positionInitialMargin": "0",
+                "openOrderInitialMargin": "0",
+                "leverage": "100",
+                "isolated": false,
+                "entryPrice": "0.00000",
+                "maxNotional": "250000",
+                "bidNotional": "0",
+                "askNotional": "0",
+                "positionSide": "BOTH",
+                "positionAmt": "0",
+                "updateTime": 0
+            }
+        ]
+    }"#;
+
+    /// Test fixture for GET /fapi/v2/positionRisk
+    const POSITION_RISK_JSON: &str = r#"[
+        {
+            "symbol": "BTCUSDT",
+            "positionAmt": "0.001",
+            "entryPrice": "50000.0",
+            "markPrice": "51000.0",
+            "unRealizedProfit": "1.00000000",
+            "liquidationPrice": "45000.0",
+            "leverage": "20",
+            "maxNotionalValue": "250000",
+            "marginType": "cross",
+            "isolatedMargin": "0.00000000",
+            "isAutoAddMargin": "false",
+            "positionSide": "BOTH",
+            "notional": "51.0",
+            "isolatedWallet": "0",
+            "updateTime": 1625474304765,
+            "breakEvenPrice": "50100.0"
+        }
+    ]"#;
+
+    /// Test fixture for balance endpoint
+    const BALANCE_JSON: &str = r#"[
+        {
+            "accountAlias": "SgsR",
+            "asset": "USDT",
+            "balance": "122.12345678",
+            "crossWalletBalance": "122.12345678",
+            "crossUnPnl": "0.00000000",
+            "availableBalance": "122.12345678",
+            "maxWithdrawAmount": "122.12345678",
+            "marginAvailable": true,
+            "updateTime": 1617939110373
+        }
+    ]"#;
+
+    /// Test fixture for order response
+    const ORDER_JSON: &str = r#"{
+        "orderId": 12345678,
+        "symbol": "BTCUSDT",
+        "status": "NEW",
+        "clientOrderId": "testOrder123",
+        "price": "50000.00",
+        "avgPrice": "0.00",
+        "origQty": "0.001",
+        "executedQty": "0.000",
+        "cumQuote": "0.00",
+        "timeInForce": "GTC",
+        "type": "LIMIT",
+        "reduceOnly": false,
+        "closePosition": false,
+        "side": "BUY",
+        "positionSide": "BOTH",
+        "stopPrice": "0.00",
+        "workingType": "CONTRACT_PRICE",
+        "priceProtect": false,
+        "origType": "LIMIT",
+        "priceMatch": "NONE",
+        "selfTradePreventionMode": "NONE",
+        "goodTillDate": 0,
+        "time": 1625474304765,
+        "updateTime": 1625474304765
+    }"#;
+
+    #[rstest]
+    fn test_parse_account_info_v2() {
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(ACCOUNT_INFO_V2_JSON).expect("Failed to parse account info");
+
+        assert_eq!(
+            account.total_wallet_balance,
+            Some("23.72469206".to_string())
+        );
+        assert_eq!(account.assets.len(), 1);
+        assert_eq!(account.assets[0].asset.as_str(), "USDT");
+        assert_eq!(account.assets[0].wallet_balance, "23.72469206");
+        assert_eq!(account.positions.len(), 1);
+        assert_eq!(account.positions[0].symbol.as_str(), "BTCUSDT");
+        assert_eq!(account.positions[0].leverage, Some("100".to_string()));
+    }
+
+    #[rstest]
+    fn test_parse_position_risk() {
+        let positions: Vec<BinancePositionRisk> =
+            serde_json::from_str(POSITION_RISK_JSON).expect("Failed to parse position risk");
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol.as_str(), "BTCUSDT");
+        assert_eq!(positions[0].position_amt, "0.001");
+        assert_eq!(positions[0].mark_price, "51000.0");
+        assert_eq!(positions[0].leverage, "20");
+    }
+
+    #[rstest]
+    fn test_parse_balance_with_v1_field() {
+        // V1 uses 'balance' field
+        let balances: Vec<BinanceFuturesBalance> =
+            serde_json::from_str(BALANCE_JSON).expect("Failed to parse balance");
+
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset.as_str(), "USDT");
+        // Uses alias to parse 'balance' into wallet_balance
+        assert_eq!(balances[0].wallet_balance, "122.12345678");
+        assert_eq!(balances[0].available_balance, "122.12345678");
+    }
+
+    #[rstest]
+    fn test_parse_balance_with_v2_field() {
+        // V2 uses 'walletBalance' field
+        let json = r#"{
+            "asset": "USDT",
+            "walletBalance": "100.00000000",
+            "availableBalance": "100.00000000",
+            "updateTime": 1617939110373
+        }"#;
+
+        let balance: BinanceFuturesBalance =
+            serde_json::from_str(json).expect("Failed to parse balance");
+
+        assert_eq!(balance.asset.as_str(), "USDT");
+        assert_eq!(balance.wallet_balance, "100.00000000");
+    }
+
+    #[rstest]
+    fn test_parse_order() {
+        let order: BinanceFuturesOrder =
+            serde_json::from_str(ORDER_JSON).expect("Failed to parse order");
+
+        assert_eq!(order.order_id, 12345678);
+        assert_eq!(order.symbol.as_str(), "BTCUSDT");
+        assert_eq!(order.status, BinanceOrderStatus::New);
+        assert_eq!(order.side, BinanceSide::Buy);
+        assert_eq!(order.order_type, BinanceFuturesOrderType::Limit);
+    }
+
+    #[rstest]
+    fn test_parse_hedge_mode_response() {
+        let json = r#"{"dualSidePosition": true}"#;
+        let response: BinanceHedgeModeResponse =
+            serde_json::from_str(json).expect("Failed to parse hedge mode");
+        assert!(response.dual_side_position);
+    }
+
+    #[rstest]
+    fn test_parse_leverage_response() {
+        let json = r#"{"symbol": "BTCUSDT", "leverage": 20, "maxNotionalValue": "250000"}"#;
+        let response: BinanceLeverageResponse =
+            serde_json::from_str(json).expect("Failed to parse leverage");
+        assert_eq!(response.symbol.as_str(), "BTCUSDT");
+        assert_eq!(response.leverage, 20);
+    }
+
+    #[rstest]
+    fn test_parse_listen_key_response() {
+        let json =
+            r#"{"listenKey": "pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"}"#;
+        let response: ListenKeyResponse =
+            serde_json::from_str(json).expect("Failed to parse listen key");
+        assert!(!response.listen_key.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_account_position() {
+        let json = r#"{
+            "symbol": "ETHUSDT",
+            "initialMargin": "100.00",
+            "maintMargin": "50.00",
+            "unrealizedProfit": "10.00",
+            "positionInitialMargin": "100.00",
+            "openOrderInitialMargin": "0",
+            "leverage": "10",
+            "isolated": true,
+            "entryPrice": "2000.00",
+            "maxNotional": "100000",
+            "bidNotional": "0",
+            "askNotional": "0",
+            "positionSide": "LONG",
+            "positionAmt": "0.5",
+            "updateTime": 1625474304765
+        }"#;
+
+        let position: BinanceAccountPosition =
+            serde_json::from_str(json).expect("Failed to parse account position");
+
+        assert_eq!(position.symbol.as_str(), "ETHUSDT");
+        assert_eq!(position.leverage, Some("10".to_string()));
+        assert_eq!(position.isolated, Some(true));
+        assert_eq!(position.position_side, Some(BinancePositionSide::Long));
+    }
+
+    #[rstest]
+    fn test_parse_algo_order() {
+        let json = r#"{
+            "algoId": 123456789,
+            "clientAlgoId": "test-algo-order-1",
+            "algoType": "CONDITIONAL",
+            "type": "STOP_MARKET",
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "positionSide": "BOTH",
+            "timeInForce": "GTC",
+            "quantity": "0.001",
+            "algoStatus": "NEW",
+            "triggerPrice": "45000.00",
+            "workingType": "MARK_PRICE",
+            "reduceOnly": false,
+            "createTime": 1625474304765,
+            "updateTime": 1625474304765
+        }"#;
+
+        let order: BinanceFuturesAlgoOrder =
+            serde_json::from_str(json).expect("Failed to parse algo order");
+
+        assert_eq!(order.algo_id, 123456789);
+        assert_eq!(order.client_algo_id, "test-algo-order-1");
+        assert_eq!(order.algo_type, BinanceAlgoType::Conditional);
+        assert_eq!(order.order_type, BinanceFuturesOrderType::StopMarket);
+        assert_eq!(order.symbol.as_str(), "BTCUSDT");
+        assert_eq!(order.side, BinanceSide::Buy);
+        assert_eq!(order.algo_status, Some(BinanceAlgoStatus::New));
+        assert_eq!(order.trigger_price, Some("45000.00".to_string()));
+    }
+
+    #[rstest]
+    fn test_parse_algo_order_triggered() {
+        let json = r#"{
+            "algoId": 123456789,
+            "clientAlgoId": "test-algo-order-2",
+            "algoType": "CONDITIONAL",
+            "type": "TAKE_PROFIT",
+            "symbol": "ETHUSDT",
+            "side": "SELL",
+            "algoStatus": "TRIGGERED",
+            "triggerPrice": "2500.00",
+            "price": "2500.00",
+            "actualOrderId": "987654321",
+            "executedQty": "0.5",
+            "avgPrice": "2499.50"
+        }"#;
+
+        let order: BinanceFuturesAlgoOrder =
+            serde_json::from_str(json).expect("Failed to parse triggered algo order");
+
+        assert_eq!(order.algo_status, Some(BinanceAlgoStatus::Triggered));
+        assert_eq!(order.order_type, BinanceFuturesOrderType::TakeProfit);
+        assert_eq!(order.actual_order_id, Some("987654321".to_string()));
+        assert_eq!(order.executed_qty, Some("0.5".to_string()));
+    }
+
+    #[rstest]
+    fn test_parse_algo_order_cancel_response() {
+        let json = r#"{
+            "algoId": 123456789,
+            "clientAlgoId": "test-algo-order-1",
+            "code": 200,
+            "msg": "success"
+        }"#;
+
+        let response: BinanceFuturesAlgoOrderCancelResponse =
+            serde_json::from_str(json).expect("Failed to parse algo cancel response");
+
+        assert_eq!(response.algo_id, 123456789);
+        assert_eq!(response.client_algo_id, "test-algo-order-1");
+        assert_eq!(response.code, 200);
+        assert_eq!(response.msg, "success");
+    }
 }

@@ -39,8 +39,8 @@ use futures_util::StreamExt;
 use nautilus_common::live::get_runtime;
 use nautilus_core::python::{call_python, to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
-    data::{Data, OrderBookDeltas_API},
-    enums::OrderType,
+    data::{BarType, Data, OrderBookDeltas_API},
+    enums::{OrderSide, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     python::{
         data::data_to_pycapsule,
@@ -50,13 +50,15 @@ use nautilus_model::{
 };
 use pyo3::{IntoPyObjectExt, exceptions::PyRuntimeError, prelude::*};
 
-use crate::websocket::{
-    client::DeribitWebSocketClient,
-    enums::DeribitUpdateInterval,
-    messages::{DeribitOrderParams, NautilusWsMessage},
+use crate::{
+    common::enums::DeribitTimeInForce,
+    websocket::{
+        client::DeribitWebSocketClient,
+        enums::DeribitUpdateInterval,
+        messages::{DeribitOrderParams, NautilusWsMessage},
+    },
 };
 
-/// Helper function to call Python callback with data conversion.
 fn call_python_with_data<F>(callback: &Py<PyAny>, data_converter: F)
 where
     F: FnOnce(Python) -> PyResult<Py<PyAny>>,
@@ -147,11 +149,9 @@ impl DeribitWebSocketClient {
         self.cancel_all_requests();
     }
 
-    /// Caches instruments for use during message parsing.
-    ///
     /// # Errors
     ///
-    /// Returns a Python exception if converting instruments fails.
+    /// Returns an error if instrument conversion fails.
     #[pyo3(name = "cache_instruments")]
     pub fn py_cache_instruments(
         &self,
@@ -166,11 +166,9 @@ impl DeribitWebSocketClient {
         Ok(())
     }
 
-    /// Caches a single instrument.
-    ///
     /// # Errors
     ///
-    /// Returns a Python exception if converting the instrument fails.
+    /// Returns an error if instrument conversion fails.
     #[pyo3(name = "cache_instrument")]
     pub fn py_cache_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
         let inst = pyobject_to_instrument_any(py, instrument)?;
@@ -178,16 +176,16 @@ impl DeribitWebSocketClient {
         Ok(())
     }
 
-    /// Sets the account ID for order/fill reports.
     #[pyo3(name = "set_account_id")]
     pub fn py_set_account_id(&mut self, account_id: AccountId) {
         self.set_account_id(account_id);
     }
 
-    /// Connects to the Deribit WebSocket and starts processing messages.
-    ///
-    /// This is a non-blocking call that spawns a background task for message processing.
-    /// Messages are dispatched to the provided callback function.
+    #[pyo3(name = "set_bars_timestamp_on_close")]
+    pub fn py_set_bars_timestamp_on_close(&mut self, value: bool) {
+        self.set_bars_timestamp_on_close(value);
+    }
+
     #[pyo3(name = "connect")]
     fn py_connect<'py>(
         &mut self,
@@ -234,43 +232,44 @@ impl DeribitWebSocketClient {
                             call_python(py, &callback, py_obj);
                         }),
                         NautilusWsMessage::Error(err) => {
-                            log::error!("Deribit WebSocket error: {err}");
+                            log::error!("WebSocket error: {err}");
                         }
                         NautilusWsMessage::Reconnected => {
-                            log::info!("Deribit WebSocket reconnected");
+                            log::info!("WebSocket reconnected");
                         }
                         NautilusWsMessage::Authenticated(auth_result) => {
-                            log::info!(
-                                "Deribit WebSocket authenticated (scope: {})",
-                                auth_result.scope
-                            );
+                            log::info!("WebSocket authenticated (scope: {})", auth_result.scope);
                         }
                         NautilusWsMessage::Raw(msg) => {
                             log::debug!("Received raw message, skipping: {msg}");
                         }
                         NautilusWsMessage::FundingRates(funding_rates) => Python::attach(|py| {
                             for funding_rate in funding_rates {
-                                let py_obj = Py::new(py, funding_rate)
-                                    .expect("Failed to create FundingRateUpdate PyObject")
-                                    .into_any();
-                                call_python(py, &callback, py_obj);
+                                match Py::new(py, funding_rate) {
+                                    Ok(py_obj) => call_python(py, &callback, py_obj.into_any()),
+                                    Err(e) => {
+                                        log::error!("Failed to create FundingRateUpdate: {e}");
+                                    }
+                                }
                             }
                         }),
                         // Execution events - route to Python callback
                         NautilusWsMessage::OrderStatusReports(reports) => Python::attach(|py| {
                             for report in reports {
-                                let py_obj = Py::new(py, report)
-                                    .expect("Failed to create OrderStatusReport PyObject")
-                                    .into_any();
-                                call_python(py, &callback, py_obj);
+                                match Py::new(py, report) {
+                                    Ok(py_obj) => call_python(py, &callback, py_obj.into_any()),
+                                    Err(e) => {
+                                        log::error!("Failed to create OrderStatusReport: {e}");
+                                    }
+                                }
                             }
                         }),
                         NautilusWsMessage::FillReports(reports) => Python::attach(|py| {
                             for report in reports {
-                                let py_obj = Py::new(py, report)
-                                    .expect("Failed to create FillReport PyObject")
-                                    .into_any();
-                                call_python(py, &callback, py_obj);
+                                match Py::new(py, report) {
+                                    Ok(py_obj) => call_python(py, &callback, py_obj.into_any()),
+                                    Err(e) => log::error!("Failed to create FillReport: {e}"),
+                                }
                             }
                         }),
                         NautilusWsMessage::OrderRejected(msg) => {
@@ -334,10 +333,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Authenticates the WebSocket session with Deribit.
-    ///
-    /// Uses the `client_signature` grant type with HMAC-SHA256 signature.
-    /// This must be called before subscribing to raw data streams.
     #[pyo3(name = "authenticate")]
     #[pyo3(signature = (session_name=None))]
     fn py_authenticate<'py>(
@@ -356,10 +351,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Authenticates with session scope using the provided session name.
-    ///
-    /// Use `DERIBIT_DATA_SESSION_NAME` for data clients and
-    /// `DERIBIT_EXECUTION_SESSION_NAME` for execution clients.
     #[pyo3(name = "authenticate_session")]
     fn py_authenticate_session<'py>(
         &self,
@@ -381,16 +372,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    // ------------------------------------------------------------------------------------------------
-    // Subscription Methods
-    // ------------------------------------------------------------------------------------------------
-
-    /// Subscribes to trade updates for an instrument.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument to subscribe to.
-    /// * `interval` - Update interval. Defaults to `Ms100` (100ms). `Raw` requires authentication.
     #[pyo3(name = "subscribe_trades")]
     #[pyo3(signature = (instrument_id, interval=None))]
     fn py_subscribe_trades<'py>(
@@ -409,24 +390,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to raw trade updates (requires authentication).
-    #[pyo3(name = "subscribe_trades_raw")]
-    fn py_subscribe_trades_raw<'py>(
-        &self,
-        py: Python<'py>,
-        instrument_id: InstrumentId,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .subscribe_trades_raw(instrument_id)
-                .await
-                .map_err(to_pyvalue_err)
-        })
-    }
-
-    /// Unsubscribes from trade updates for an instrument.
     #[pyo3(name = "unsubscribe_trades")]
     #[pyo3(signature = (instrument_id, interval=None))]
     fn py_unsubscribe_trades<'py>(
@@ -445,77 +408,58 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to order book updates for an instrument.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument to subscribe to.
-    /// * `interval` - Update interval. Defaults to `Ms100` (100ms). `Raw` requires authentication.
     #[pyo3(name = "subscribe_book")]
-    #[pyo3(signature = (instrument_id, interval=None))]
+    #[pyo3(signature = (instrument_id, interval=None, depth=None))]
     fn py_subscribe_book<'py>(
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
         interval: Option<DeribitUpdateInterval>,
+        depth: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .subscribe_book(instrument_id, interval)
-                .await
-                .map_err(to_pyvalue_err)
+            if let Some(d) = depth {
+                client
+                    .subscribe_book_grouped(instrument_id, "none", d, interval)
+                    .await
+                    .map_err(to_pyvalue_err)
+            } else {
+                client
+                    .subscribe_book(instrument_id, interval)
+                    .await
+                    .map_err(to_pyvalue_err)
+            }
         })
     }
 
-    /// Subscribes to raw order book updates (requires authentication).
-    #[pyo3(name = "subscribe_book_raw")]
-    fn py_subscribe_book_raw<'py>(
-        &self,
-        py: Python<'py>,
-        instrument_id: InstrumentId,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .subscribe_book_raw(instrument_id)
-                .await
-                .map_err(to_pyvalue_err)
-        })
-    }
-
-    /// Unsubscribes from order book updates for an instrument.
     #[pyo3(name = "unsubscribe_book")]
-    #[pyo3(signature = (instrument_id, interval=None))]
+    #[pyo3(signature = (instrument_id, interval=None, depth=None))]
     fn py_unsubscribe_book<'py>(
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
         interval: Option<DeribitUpdateInterval>,
+        depth: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .unsubscribe_book(instrument_id, interval)
-                .await
-                .map_err(to_pyvalue_err)
+            if let Some(d) = depth {
+                client
+                    .unsubscribe_book_grouped(instrument_id, "none", d, interval)
+                    .await
+                    .map_err(to_pyvalue_err)
+            } else {
+                client
+                    .unsubscribe_book(instrument_id, interval)
+                    .await
+                    .map_err(to_pyvalue_err)
+            }
         })
     }
 
-    /// Subscribes to grouped order book updates for an instrument.
-    ///
-    /// Uses the Deribit `book.{instrument}.{group}.{depth}.{interval}` channel format.
-    /// This provides depth-limited order book data with configurable grouping.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument to subscribe to.
-    /// * `group` - Price grouping level (e.g., "none", "1", "2", "5", "10", "25", "100", "250").
-    /// * `depth` - Number of price levels per side (1, 10, or 20).
-    /// * `interval` - Update interval. Defaults to `Ms100` (100ms). `Raw` requires authentication.
     #[pyo3(name = "subscribe_book_grouped")]
     #[pyo3(signature = (instrument_id, group, depth, interval=None))]
     fn py_subscribe_book_grouped<'py>(
@@ -536,14 +480,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Unsubscribes from grouped order book updates for an instrument.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument to unsubscribe from.
-    /// * `group` - Price grouping level (e.g., "none", "1", "2", "5", "10", "25", "100", "250").
-    /// * `depth` - Number of price levels per side (1, 10, or 20).
-    /// * `interval` - Update interval. Defaults to `Ms100` (100ms).
     #[pyo3(name = "unsubscribe_book_grouped")]
     #[pyo3(signature = (instrument_id, group, depth, interval=None))]
     fn py_unsubscribe_book_grouped<'py>(
@@ -564,12 +500,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to ticker updates for an instrument.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument to subscribe to.
-    /// * `interval` - Update interval. Defaults to `Ms100` (100ms). `Raw` requires authentication.
     #[pyo3(name = "subscribe_ticker")]
     #[pyo3(signature = (instrument_id, interval=None))]
     fn py_subscribe_ticker<'py>(
@@ -588,24 +518,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to raw ticker updates (requires authentication).
-    #[pyo3(name = "subscribe_ticker_raw")]
-    fn py_subscribe_ticker_raw<'py>(
-        &self,
-        py: Python<'py>,
-        instrument_id: InstrumentId,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .subscribe_ticker_raw(instrument_id)
-                .await
-                .map_err(to_pyvalue_err)
-        })
-    }
-
-    /// Unsubscribes from ticker updates for an instrument.
     #[pyo3(name = "unsubscribe_ticker")]
     #[pyo3(signature = (instrument_id, interval=None))]
     fn py_unsubscribe_ticker<'py>(
@@ -624,7 +536,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to quote (best bid/ask) updates for an instrument.
     #[pyo3(name = "subscribe_quotes")]
     fn py_subscribe_quotes<'py>(
         &self,
@@ -641,7 +552,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Unsubscribes from quote updates for an instrument.
     #[pyo3(name = "unsubscribe_quotes")]
     fn py_unsubscribe_quotes<'py>(
         &self,
@@ -658,7 +568,72 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to multiple channels at once.
+    #[pyo3(name = "subscribe_user_orders")]
+    fn py_subscribe_user_orders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client.subscribe_user_orders().await.map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_user_orders")]
+    fn py_unsubscribe_user_orders<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_user_orders()
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "subscribe_user_trades")]
+    fn py_subscribe_user_trades<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client.subscribe_user_trades().await.map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_user_trades")]
+    fn py_unsubscribe_user_trades<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_user_trades()
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "subscribe_user_portfolio")]
+    fn py_subscribe_user_portfolio<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_user_portfolio()
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_user_portfolio")]
+    fn py_unsubscribe_user_portfolio<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_user_portfolio()
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
     #[pyo3(name = "subscribe")]
     fn py_subscribe<'py>(
         &self,
@@ -672,7 +647,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Unsubscribes from multiple channels at once.
     #[pyo3(name = "unsubscribe")]
     fn py_unsubscribe<'py>(
         &self,
@@ -686,12 +660,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to instrument state changes for a kind/currency pair.
-    ///
-    /// # Arguments
-    ///
-    /// * `kind` - Instrument kind: "future", "option", "spot", "future_combo", "option_combo", or "any"
-    /// * `currency` - Currency: "BTC", "ETH", "USDC", "USDT", "EURR", or "any"
     #[pyo3(name = "subscribe_instrument_state")]
     fn py_subscribe_instrument_state<'py>(
         &self,
@@ -709,12 +677,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Unsubscribes from instrument state changes for a kind/currency pair.
-    ///
-    /// # Arguments
-    ///
-    /// * `kind` - Instrument kind: "future", "option", "spot", "future_combo", "option_combo", or "any"
-    /// * `currency` - Currency: "BTC", "ETH", "USDC", "USDT", "EURR", or "any"
     #[pyo3(name = "unsubscribe_instrument_state")]
     fn py_unsubscribe_instrument_state<'py>(
         &self,
@@ -732,15 +694,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to perpetual interest rates updates (funding rates).
-    ///
-    /// Uses the Deribit `perpetual.{instrument_name}.{interval}` WebSocket channel.
-    /// This provides mark price, index price, and funding rate information.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The perpetual instrument to subscribe to.
-    /// * `interval` - Update interval. Defaults to 100ms. Use None for 100ms.
     #[pyo3(name = "subscribe_perpetual_interest_rates")]
     #[pyo3(signature = (instrument_id, interval=None))]
     fn py_subscribe_perpetual_interest_rates<'py>(
@@ -759,12 +712,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Unsubscribes from perpetual interest rates updates (funding rates).
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The perpetual instrument to unsubscribe from.
-    /// * `interval` - Update interval. Defaults to 100ms. Use None for 100ms.
     #[pyo3(name = "unsubscribe_perpetual_interest_rates")]
     #[pyo3(signature = (instrument_id, interval=None))]
     fn py_unsubscribe_perpetual_interest_rates<'py>(
@@ -783,13 +730,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Subscribes to chart/OHLC bar updates for an instrument.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument to subscribe to
-    /// * `resolution` - Bar resolution: "1", "3", "5", "10", "15", "30", "60", "120", "180",
-    ///                  "360", "720", "1D" (minutes or 1D for daily)
     #[pyo3(name = "subscribe_chart")]
     fn py_subscribe_chart<'py>(
         &self,
@@ -807,7 +747,6 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Unsubscribes from chart/OHLC bar updates.
     #[pyo3(name = "unsubscribe_chart")]
     fn py_unsubscribe_chart<'py>(
         &self,
@@ -825,11 +764,41 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Submits a buy order to Deribit via WebSocket.
-    ///
-    /// Requires authentication (call `authenticate_session()` first).
-    #[pyo3(name = "buy")]
+    #[pyo3(name = "subscribe_bars")]
+    fn py_subscribe_bars<'py>(
+        &self,
+        py: Python<'py>,
+        bar_type: BarType,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_bars(bar_type)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_bars")]
+    fn py_unsubscribe_bars<'py>(
+        &self,
+        py: Python<'py>,
+        bar_type: BarType,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_bars(bar_type)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    #[pyo3(name = "submit_order")]
     #[pyo3(signature = (
+        order_side,
         quantity,
         order_type,
         client_order_id,
@@ -844,9 +813,10 @@ impl DeribitWebSocketClient {
         trigger=None,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn py_buy<'py>(
+    fn py_submit_order<'py>(
         &self,
         py: Python<'py>,
+        order_side: OrderSide,
         quantity: Quantity,
         order_type: OrderType,
         client_order_id: ClientOrderId,
@@ -854,7 +824,7 @@ impl DeribitWebSocketClient {
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
         price: Option<Price>,
-        time_in_force: Option<String>,
+        time_in_force: Option<TimeInForce>,
         post_only: bool,
         reduce_only: bool,
         trigger_price: Option<Price>,
@@ -863,14 +833,24 @@ impl DeribitWebSocketClient {
         let client = self.clone();
         let instrument_name = instrument_id.symbol.to_string();
 
+        // Convert Nautilus TimeInForce to Deribit format
+        let deribit_tif = time_in_force
+            .map(|tif| {
+                DeribitTimeInForce::try_from(tif)
+                    .map(|deribit_tif| deribit_tif.as_str().to_string())
+            })
+            .transpose()
+            .map_err(to_pyvalue_err)?;
+
         let params = DeribitOrderParams {
             instrument_name,
             amount: quantity.as_decimal(),
             order_type: order_type.to_string().to_lowercase(),
             label: Some(client_order_id.to_string()),
             price: price.map(|p| p.as_decimal()),
-            time_in_force,
+            time_in_force: deribit_tif,
             post_only: if post_only { Some(true) } else { None },
+            reject_post_only: if post_only { Some(true) } else { None },
             reduce_only: if reduce_only { Some(true) } else { None },
             trigger_price: trigger_price.map(|p| p.as_decimal()),
             trigger,
@@ -880,7 +860,8 @@ impl DeribitWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
-                .buy(
+                .submit_order(
+                    order_side,
                     params,
                     client_order_id,
                     trader_id,
@@ -893,88 +874,9 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Submits a sell order to Deribit via WebSocket.
-    ///
-    /// Requires authentication (call `authenticate_session()` first).
-    #[pyo3(name = "sell")]
-    #[pyo3(signature = (
-        quantity,
-        order_type,
-        client_order_id,
-        trader_id,
-        strategy_id,
-        instrument_id,
-        price=None,
-        time_in_force=None,
-        post_only=false,
-        reduce_only=false,
-        trigger_price=None,
-        trigger=None,
-    ))]
+    #[pyo3(name = "modify_order")]
     #[allow(clippy::too_many_arguments)]
-    fn py_sell<'py>(
-        &self,
-        py: Python<'py>,
-        quantity: Quantity,
-        order_type: OrderType,
-        client_order_id: ClientOrderId,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        price: Option<Price>,
-        time_in_force: Option<String>,
-        post_only: bool,
-        reduce_only: bool,
-        trigger_price: Option<Price>,
-        trigger: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.clone();
-        let instrument_name = instrument_id.symbol.to_string();
-
-        let params = DeribitOrderParams {
-            instrument_name,
-            amount: quantity.as_decimal(),
-            order_type: order_type.to_string().to_lowercase(),
-            label: Some(client_order_id.to_string()),
-            price: price.map(|p| p.as_decimal()),
-            time_in_force,
-            post_only: if post_only { Some(true) } else { None },
-            reduce_only: if reduce_only { Some(true) } else { None },
-            trigger_price: trigger_price.map(|p| p.as_decimal()),
-            trigger,
-            max_show: None,
-            valid_until: None,
-        };
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .sell(
-                    params,
-                    client_order_id,
-                    trader_id,
-                    strategy_id,
-                    instrument_id,
-                )
-                .await
-                .map_err(to_pyruntime_err)?;
-            Ok(())
-        })
-    }
-
-    /// Modifies an existing order via WebSocket.
-    ///
-    /// # Arguments
-    ///
-    /// * `order_id` - The venue order ID (Deribit order ID) to modify
-    /// * `quantity` - The new order quantity
-    /// * `price` - The new order price
-    /// * `client_order_id` - The client order ID for correlation
-    /// * `trader_id` - The trader ID for order tracking
-    /// * `strategy_id` - The strategy ID for order tracking
-    /// * `instrument_id` - The instrument ID for order tracking
-    #[pyo3(name = "edit")]
-    #[allow(clippy::too_many_arguments)]
-    fn py_edit<'py>(
+    fn py_modify_order<'py>(
         &self,
         py: Python<'py>,
         order_id: String,
@@ -989,7 +891,7 @@ impl DeribitWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
-                .edit(
+                .modify_order(
                     &order_id,
                     quantity,
                     price,
@@ -1004,17 +906,8 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Cancels an existing order via WebSocket.
-    ///
-    /// # Arguments
-    ///
-    /// * `order_id` - The venue order ID (Deribit order ID) to cancel
-    /// * `client_order_id` - The client order ID for correlation
-    /// * `trader_id` - The trader ID for order tracking
-    /// * `strategy_id` - The strategy ID for order tracking
-    /// * `instrument_id` - The instrument ID for order tracking
-    #[pyo3(name = "cancel")]
-    fn py_cancel<'py>(
+    #[pyo3(name = "cancel_order")]
+    fn py_cancel_order<'py>(
         &self,
         py: Python<'py>,
         order_id: String,
@@ -1027,7 +920,7 @@ impl DeribitWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
-                .cancel(
+                .cancel_order(
                     &order_id,
                     client_order_id,
                     trader_id,
@@ -1040,49 +933,27 @@ impl DeribitWebSocketClient {
         })
     }
 
-    /// Cancels all orders for a specific instrument via WebSocket.
-    ///
-    /// Uses the `private/cancel_all_by_instrument` JSON-RPC method.
-    /// Requires authentication (call `authenticate_session()` first).
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument to cancel all orders for
-    /// * `order_type` - Optional order type filter ("all", "limit", "stop_all", etc.)
-    #[pyo3(name = "cancel_all_by_instrument")]
+    #[pyo3(name = "cancel_all_orders")]
     #[pyo3(signature = (instrument_id, order_type=None))]
-    fn py_cancel_all_by_instrument<'py>(
+    fn py_cancel_all_orders<'py>(
         &self,
         py: Python<'py>,
         instrument_id: InstrumentId,
         order_type: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
-        let instrument_name = instrument_id.symbol.to_string();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
-                .cancel_all_by_instrument(&instrument_name, instrument_id, order_type)
+                .cancel_all_orders(instrument_id, order_type)
                 .await
                 .map_err(to_pyruntime_err)?;
             Ok(())
         })
     }
 
-    /// Queries the current state of an order via WebSocket.
-    ///
-    /// Uses the `private/get_order_state` JSON-RPC method.
-    /// Requires authentication (call `authenticate_session()` first).
-    ///
-    /// # Arguments
-    ///
-    /// * `order_id` - The venue order ID (Deribit order ID) to query
-    /// * `client_order_id` - The client order ID for correlation
-    /// * `trader_id` - The trader ID for order tracking
-    /// * `strategy_id` - The strategy ID for order tracking
-    /// * `instrument_id` - The instrument ID for order tracking
-    #[pyo3(name = "get_order_state")]
-    fn py_get_order_state<'py>(
+    #[pyo3(name = "query_order")]
+    fn py_query_order<'py>(
         &self,
         py: Python<'py>,
         order_id: String,
@@ -1095,7 +966,7 @@ impl DeribitWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
-                .get_order_state(
+                .query_order(
                     &order_id,
                     client_order_id,
                     trader_id,

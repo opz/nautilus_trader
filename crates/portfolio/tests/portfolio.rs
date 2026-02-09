@@ -218,7 +218,7 @@ fn get_bar(
 ) -> Bar {
     let bar_type_str = format!("{}-1-MINUTE-LAST-EXTERNAL", instrument.id());
     Bar::new(
-        BarType::from(bar_type_str.as_ref()),
+        BarType::from(bar_type_str),
         Price::new(open, 0),
         Price::new(high, 0),
         Price::new(low, 0),
@@ -1113,13 +1113,15 @@ fn test_opening_positions_with_multi_asset_account(
         .quantity(Quantity::from("10000"))
         .build();
 
+    let account_id = AccountId::new("BITMEX-01234");
+
     let filled = OrderFilled::new(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
         order.client_order_id(),
         VenueOrderId::new("123456"),
-        AccountId::new("SIM-001"),
+        account_id,
         TradeId::new("1"),
         order.order_side(),
         order.order_type(),
