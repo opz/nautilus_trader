@@ -713,7 +713,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
 
             instrument = self._cache.instrument(instrument_id)
             if instrument is None:
-                self._log.warning(
+                self._log.debug(
                     f"Cannot handle trade report: instrument {instrument_id} not found "
                     f"(market={polymarket_trade.market}, asset_id={asset_id})",
                 )
@@ -1856,7 +1856,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
         instrument = self._cache.instrument(instrument_id)
 
         if instrument is None:
-            self._log.warning(
+            self._log.debug(
                 f"Received trade message for unknown instrument {instrument_id} "
                 f"(market={msg.market}, asset_id={asset_id}). "
                 f"This may indicate the instrument is not subscribed or cached, skipping trade processing",
