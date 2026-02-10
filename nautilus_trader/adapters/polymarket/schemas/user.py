@@ -41,6 +41,7 @@ from nautilus_trader.model.currencies import USDC_POS
 from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
@@ -313,6 +314,19 @@ class PolymarketOpenOrder(msgspec.Struct, frozen=True):
             pd.Timestamp(int(self.expiration), unit="ms", tz="UTC") if self.expiration else None
         )
         timestamp_ns = secs_to_nanos(int(self.created_at))
+
+        order_status = parse_order_status(order_status=self.status)
+        filled_qty = instrument.make_qty(float(self.size_matched))
+
+        # Polymarket may return MATCHED status for orders that were cancelled
+        # before any fills occurred (size_matched == 0). Treat these as CANCELED
+        # to prevent infinite reconciliation loops in the execution engine.
+        if order_status == OrderStatus.FILLED and filled_qty.as_double() == 0:
+            order_status = OrderStatus.CANCELED
+
+        price = instrument.make_price(float(self.price))
+        avg_px = price if filled_qty.as_double() > 0 else None
+
         return OrderStatusReport(
             account_id=account_id,
             instrument_id=instrument.id,
@@ -324,10 +338,11 @@ class PolymarketOpenOrder(msgspec.Struct, frozen=True):
             contingency_type=ContingencyType.NO_CONTINGENCY,
             time_in_force=parse_time_in_force(order_type=self.order_type),
             expire_time=expire_time,
-            order_status=parse_order_status(order_status=self.status),
-            price=instrument.make_price(float(self.price)),
+            order_status=order_status,
+            price=price,
+            avg_px=avg_px,
             quantity=instrument.make_qty(float(self.original_size)),
-            filled_qty=instrument.make_qty(float(self.size_matched)),
+            filled_qty=filled_qty,
             ts_accepted=timestamp_ns,
             ts_last=timestamp_ns,
             report_id=UUID4(),
