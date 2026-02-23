@@ -770,8 +770,15 @@ class PolymarketExecutionClient(LiveExecutionClient):
             )
             size_val = p.get("size", 0) or 0
             avg_price_val = p.get("avgPrice")
+            redeemable = p.get("redeemable", False)
             try:
                 size = float(size_val)
+                if redeemable and size > 0:
+                    self._log.info(
+                        f"Position for {instrument_id} is redeemable (market settled), "
+                        f"size={size}, reporting as FLAT",
+                    )
+                    size = 0.0
                 avg_price = Decimal(str(avg_price_val)) if avg_price_val else None
                 position_data[instrument_id] = (size, avg_price)
             except Exception as e:
