@@ -157,12 +157,16 @@ class PolymarketInstrumentProvider(InstrumentProvider):
 
     def _load_instruments_from_event(self, event: dict[str, Any]) -> int:
         count = 0
+        event_slug = event.get("slug", "")
+        series_slug = event.get("seriesSlug", "")
         for market in event.get("markets", []):
             condition_id = market.get("conditionId")
             if not condition_id:
                 continue
 
             normalized_market = normalize_gamma_market_to_clob_format(market)
+            normalized_market["event_slug"] = event_slug
+            normalized_market["series_slug"] = series_slug
 
             for token_info in normalized_market.get("tokens", []):
                 token_id = token_info["token_id"]
