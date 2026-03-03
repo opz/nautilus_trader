@@ -661,6 +661,23 @@ class PolymarketExecutionClient(LiveExecutionClient):
         # Generate reports from quantities
         for instrument_id, (quantity, avg_px_open) in quantities_by_instrument.items():
             position_side = PositionSide.LONG if quantity.raw > 0 else PositionSide.FLAT
+
+            # Recover avg_px from fill history when Data API returns null
+            if avg_px_open is None and quantity.raw > 0:
+                self._log.warning(
+                    f"avgPrice is null from Data API for {instrument_id} "
+                    f"(qty={quantity}), computing from fill history",
+                )
+                avg_px_open = await self._compute_avg_px_from_fills(instrument_id)
+                if avg_px_open is not None:
+                    self._log.info(
+                        f"Recovered avg_px={avg_px_open} from fills for {instrument_id}",
+                    )
+                else:
+                    self._log.warning(
+                        f"Could not recover avg_px from fills for {instrument_id}",
+                    )
+
             if position_side == PositionSide.LONG:
                 self._log.info(
                     f"Long position for {instrument_id} of {quantity} shares"
@@ -743,6 +760,63 @@ class PolymarketExecutionClient(LiveExecutionClient):
 
             parsed_fill_keys.add(fill_key)
             reports.append(report)
+
+    async def _compute_avg_px_from_fills(
+        self,
+        instrument_id: InstrumentId,
+    ) -> Decimal | None:
+        """Compute weighted average *entry* price from trade history.
+
+        Used as fallback when the Data API returns null avgPrice.
+        Only BUY fills are included (SELL fills reduce position, not entry cost).
+        """
+        condition_id = get_polymarket_condition_id(instrument_id)
+        token_id = str(get_polymarket_token_id(instrument_id))
+
+        params = TradeParams()
+        params.market = condition_id
+
+        retry_manager = await self._retry_manager_pool.acquire()
+        try:
+            response = await retry_manager.run(
+                "compute_avg_px_from_fills",
+                [instrument_id],
+                asyncio.to_thread,
+                self._http_client.get_trades,
+                params=params,
+            )
+        finally:
+            await self._retry_manager_pool.release(retry_manager)
+
+        if not response:
+            return None
+
+        total_cost = Decimal(0)
+        total_qty = Decimal(0)
+
+        for json_obj in response:
+            raw = msgspec.json.encode(json_obj)
+            trade = self._decoder_trade_report.decode(raw)
+
+            filled_ids = trade.get_filled_user_order_ids(
+                self._wallet_address,
+                self._api_key,
+            )
+            for order_id in filled_ids:
+                asset_id = trade.get_asset_id(order_id)
+                if asset_id != token_id:
+                    continue
+                # Only count BUY fills toward avg entry price
+                if trade.order_side(order_id) != OrderSide.BUY:
+                    continue
+                px = trade.last_px(order_id)
+                qty = trade.last_qty(order_id)
+                total_cost += px * qty
+                total_qty += qty
+
+        if total_qty > 0:
+            return total_cost / total_qty
+        return None
 
     async def _fetch_quantities_from_gamma_api(
         self,
