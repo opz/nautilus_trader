@@ -1770,7 +1770,6 @@ class PolymarketExecutionClient(LiveExecutionClient):
         self._handle_user_trade_in_ws_trade_msg(
             msg,
             trade_id,
-            wait_for_ack=False,
             order_id=order_id,
         )
 
@@ -1919,15 +1918,41 @@ class PolymarketExecutionClient(LiveExecutionClient):
         # For same status or new trades, process fills (per-fill dedup handles duplicates)
 
         filled_user_order_ids = msg.get_filled_user_order_ids(self._wallet_address, self._api_key)
-        for order_id in filled_user_order_ids:
-            self._handle_user_trade_in_ws_trade_msg(msg, trade_id, wait_for_ack, order_id)
 
-        # After all maker fills are processed, emit synthetic cancel for any IOC
-        # order that is still partially filled.  IOC semantics guarantee no further
-        # fills, but Polymarket never sends a WebSocket cancel event for the
-        # unfilled remainder, leaving the order stuck in PARTIALLY_FILLED.
-        if not wait_for_ack:
+        if wait_for_ack:
+            # Coordinate all fill ack tasks so the synthetic IOC cancel fires
+            # only after every maker fill has been processed.
+            self.create_task(
+                self._process_trade_fills_with_ack(msg, filled_user_order_ids),
+            )
+        else:
+            for order_id in filled_user_order_ids:
+                self._handle_user_trade_in_ws_trade_msg(msg, trade_id, order_id)
+            # After all maker fills are processed, emit synthetic cancel for any
+            # IOC order still partially filled.  IOC semantics guarantee no further
+            # fills, but Polymarket never sends a WebSocket cancel event for the
+            # unfilled remainder, leaving the order stuck in PARTIALLY_FILLED.
             self._emit_synthetic_ioc_cancels(msg, filled_user_order_ids)
+
+    async def _process_trade_fills_with_ack(
+        self,
+        msg: PolymarketUserTrade,
+        filled_user_order_ids: list[str],
+    ):
+        """Wait for all fill acks in parallel, then emit synthetic IOC cancels."""
+        results = await asyncio.gather(
+            *(
+                self._wait_for_ack_trade(msg, msg.venue_order_id(order_id))
+                for order_id in filled_user_order_ids
+            ),
+            return_exceptions=True,
+        )
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                self._log.error(
+                    f"Exception processing fill {filled_user_order_ids[i]}: {result}",
+                )
+        self._emit_synthetic_ioc_cancels(msg, filled_user_order_ids)
 
     def _emit_synthetic_ioc_cancels(
         self,
@@ -1954,6 +1979,9 @@ class PolymarketExecutionClient(LiveExecutionClient):
             ):
                 strategy_id = self._cache.strategy_id_for_order(client_order_id)
                 if strategy_id is None:
+                    self._log.warning(
+                        f"Cannot emit synthetic IOC cancel: strategy ID not found for {client_order_id}",
+                    )
                     continue
 
                 asset_id = msg.get_asset_id(order_id)
@@ -1974,7 +2002,6 @@ class PolymarketExecutionClient(LiveExecutionClient):
         self,
         msg: PolymarketUserTrade,
         trade_id: TradeId,
-        wait_for_ack: bool,
         order_id: str,
     ):
         venue_order_id = msg.venue_order_id(order_id)
@@ -1990,10 +2017,6 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 f"(market={msg.market}, asset_id={asset_id}). "
                 f"This may indicate the instrument is not subscribed or cached, skipping trade processing",
             )
-            return
-
-        if wait_for_ack:
-            self.create_task(self._wait_for_ack_trade(msg, venue_order_id))
             return
 
         # Check if this specific fill was already processed (handles multi-order trades)
