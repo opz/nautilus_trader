@@ -1997,6 +1997,12 @@ class PolymarketExecutionClient(LiveExecutionClient):
         commission = calculate_commission(last_qty, last_px, msg.get_fee_rate_bps(order_id))
         ts_event = secs_to_nanos(int(msg.match_time))
 
+        # Detect IOC partial fill BEFORE generate_order_filled updates order state
+        is_ioc_partial = (
+            order.time_in_force == TimeInForce.IOC
+            and last_qty < order.leaves_qty
+        )
+
         self.generate_order_filled(
             strategy_id=strategy_id,
             instrument_id=instrument_id,
@@ -2017,6 +2023,18 @@ class PolymarketExecutionClient(LiveExecutionClient):
 
         self._record_processed_fill(trade_id, venue_order_id)
         self._record_processed_trade(trade_id, msg.status)
+
+        if is_ioc_partial:
+            self._log.info(
+                f"IOC partial fill: generating synthetic cancel for {client_order_id}",
+            )
+            self.generate_order_canceled(
+                strategy_id=strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=ts_event,
+            )
 
         # Only update account balance after trade is mined on-chain
         if msg.status in POLYMARKET_FINALIZED_TRADE_STATUSES:
