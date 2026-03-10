@@ -1922,6 +1922,54 @@ class PolymarketExecutionClient(LiveExecutionClient):
         for order_id in filled_user_order_ids:
             self._handle_user_trade_in_ws_trade_msg(msg, trade_id, wait_for_ack, order_id)
 
+        # After all maker fills are processed, emit synthetic cancel for any IOC
+        # order that is still partially filled.  IOC semantics guarantee no further
+        # fills, but Polymarket never sends a WebSocket cancel event for the
+        # unfilled remainder, leaving the order stuck in PARTIALLY_FILLED.
+        if not wait_for_ack:
+            self._emit_synthetic_ioc_cancels(msg, filled_user_order_ids)
+
+    def _emit_synthetic_ioc_cancels(
+        self,
+        msg: PolymarketUserTrade,
+        filled_user_order_ids: list[str],
+    ):
+        seen_client_order_ids: set[ClientOrderId] = set()
+        ts_event = secs_to_nanos(int(msg.match_time))
+
+        for order_id in filled_user_order_ids:
+            venue_order_id = msg.venue_order_id(order_id)
+            client_order_id = self._cache.client_order_id(venue_order_id)
+            if client_order_id is None or client_order_id in seen_client_order_ids:
+                continue
+            seen_client_order_ids.add(client_order_id)
+
+            order = self._cache.order(client_order_id)
+            if order is None:
+                continue
+
+            if (
+                order.time_in_force == TimeInForce.IOC
+                and order.status == OrderStatus.PARTIALLY_FILLED
+            ):
+                strategy_id = self._cache.strategy_id_for_order(client_order_id)
+                if strategy_id is None:
+                    continue
+
+                asset_id = msg.get_asset_id(order_id)
+                instrument_id = get_polymarket_instrument_id(msg.market, asset_id)
+
+                self._log.info(
+                    f"IOC partial fill: generating synthetic cancel for {client_order_id}",
+                )
+                self.generate_order_canceled(
+                    strategy_id=strategy_id,
+                    instrument_id=instrument_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=venue_order_id,
+                    ts_event=ts_event,
+                )
+
     def _handle_user_trade_in_ws_trade_msg(
         self,
         msg: PolymarketUserTrade,
@@ -1997,12 +2045,6 @@ class PolymarketExecutionClient(LiveExecutionClient):
         commission = calculate_commission(last_qty, last_px, msg.get_fee_rate_bps(order_id))
         ts_event = secs_to_nanos(int(msg.match_time))
 
-        # Detect IOC partial fill BEFORE generate_order_filled updates order state
-        is_ioc_partial = (
-            order.time_in_force == TimeInForce.IOC
-            and last_qty < order.leaves_qty
-        )
-
         self.generate_order_filled(
             strategy_id=strategy_id,
             instrument_id=instrument_id,
@@ -2023,18 +2065,6 @@ class PolymarketExecutionClient(LiveExecutionClient):
 
         self._record_processed_fill(trade_id, venue_order_id)
         self._record_processed_trade(trade_id, msg.status)
-
-        if is_ioc_partial:
-            self._log.info(
-                f"IOC partial fill: generating synthetic cancel for {client_order_id}",
-            )
-            self.generate_order_canceled(
-                strategy_id=strategy_id,
-                instrument_id=instrument_id,
-                client_order_id=client_order_id,
-                venue_order_id=venue_order_id,
-                ts_event=ts_event,
-            )
 
         # Only update account balance after trade is mined on-chain
         if msg.status in POLYMARKET_FINALIZED_TRADE_STATUSES:
