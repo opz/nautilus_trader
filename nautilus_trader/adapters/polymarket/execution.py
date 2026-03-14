@@ -14,7 +14,6 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
-import hashlib
 import json
 from collections import OrderedDict
 from collections import defaultdict
@@ -106,7 +105,6 @@ from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import AccountBalance
 from nautilus_trader.model.objects import Money
-from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
@@ -235,7 +233,6 @@ class PolymarketExecutionClient(LiveExecutionClient):
         self._finalized_trades: OrderedDict[TradeId, None] = OrderedDict()
         self._ack_events_order: dict[VenueOrderId, asyncio.Event] = {}
         self._ack_events_trade: dict[VenueOrderId, asyncio.Event] = {}
-        self._redeemable_instruments: set[InstrumentId] = set()
 
     async def _connect(self) -> None:
         await self._instrument_provider.initialize()
@@ -637,58 +634,6 @@ class PolymarketExecutionClient(LiveExecutionClient):
         finally:
             await self._retry_manager_pool.release(retry_manager)
 
-        # Generate synthetic settlement fill for redeemable (settled) markets
-        if (
-            command.instrument_id is not None
-            and command.instrument_id in self._redeemable_instruments
-            and not reports
-        ):
-            cached_positions = self._cache.positions_open(
-                instrument_id=command.instrument_id,
-            )
-            if cached_positions:
-                position = cached_positions[0]
-                instrument = self._cache.instrument(command.instrument_id)
-                if instrument is None:
-                    self._log.warning(
-                        f"Cannot generate synthetic settlement fill for "
-                        f"{command.instrument_id}: instrument not found in cache",
-                    )
-                else:
-                    qty = position.quantity
-                    side = OrderSide.SELL if position.side == PositionSide.LONG else OrderSide.BUY
-                    settlement_price = (
-                        Price(1.0, instrument.price_precision)
-                        if side == OrderSide.SELL
-                        else Price(0.0, instrument.price_precision)
-                    )
-                    # TradeId max 36 chars — deterministic per instrument for
-                    # stable dedup across process restarts
-                    settle_hash = hashlib.md5(
-                        f"{command.instrument_id}-SETTLEMENT".encode(),
-                    ).hexdigest()[:27]
-                    reports.append(
-                        FillReport(
-                            account_id=self.account_id,
-                            instrument_id=command.instrument_id,
-                            venue_order_id=VenueOrderId(f"SETTLE-{settle_hash}"),
-                            trade_id=TradeId(f"SETTLE-{settle_hash}"),
-                            order_side=side,
-                            last_qty=qty,
-                            last_px=settlement_price,
-                            commission=Money(0, USDC_POS),
-                            liquidity_side=LiquiditySide.TAKER,
-                            report_id=UUID4(),
-                            ts_event=self._clock.timestamp_ns(),
-                            ts_init=self._clock.timestamp_ns(),
-                        ),
-                    )
-                    self._log.info(
-                        f"Generated synthetic settlement fill for {command.instrument_id}: "
-                        f"side={side}, qty={qty}",
-                    )
-                    self._redeemable_instruments.discard(command.instrument_id)
-
         self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
 
         return reports
@@ -907,7 +852,6 @@ class PolymarketExecutionClient(LiveExecutionClient):
                         f"Position for {instrument_id} is redeemable (market settled), "
                         f"size={size}, reporting as FLAT",
                     )
-                    self._redeemable_instruments.add(instrument_id)
                     size = 0.0
                 avg_price = Decimal(str(avg_price_val)) if avg_price_val else None
                 position_data[instrument_id] = (size, avg_price)
